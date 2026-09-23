@@ -675,7 +675,7 @@ const TILE_VS = /* glsl */`
     gl_Position = projectionMatrix*viewMatrix*vec4(position,1.0);
   }`;
 const TILE_FS = GLSL_COMMON + /* glsl */`
-  uniform sampler2D map, nightMap, waterMap, radarMap, waterMask;
+  uniform sampler2D map, nightMap, waterMap, radarMap;
   uniform float hasDem;
   uniform float showRadar, showTemp, showLights, cloudShadow;
   varying vec2 vUv; varying vec2 vUvG; varying vec3 vPos; varying vec3 vN; varying float vH;
@@ -685,13 +685,14 @@ const TILE_FS = GLSL_COMMON + /* glsl */`
     vec3 e = eastOf(n); vec3 no = cross(n, e);
     vec3 V = normalize(cameraPosition - vPos);
     float camDist = length(cameraPosition - vPos);
-    vec3 day = texture2D(map, vUv).rgb;
+    vec4 tile = texture2D(map, vUv);                 // rgb = imagery, a = water mask
+    vec3 day = tile.rgb;
     float lum = dot(day, vec3(0.299,0.587,0.114));
     day = mix(vec3(lum), day, 1.15);
     day = pow(day, vec3(1.06));
     float wm = texture2D(waterMap, vUvG).r;
     // crisp coastline from the tile's own elevation mask; the coarse global map only vetoes inland depressions
-    float water = hasDem > 0.5 ? smoothstep(0.3, 0.7, texture2D(waterMask, vUv).r) * smoothstep(0.05, 0.3, wm) : smoothstep(0.45, 0.65, wm);
+    float water = hasDem > 0.5 ? smoothstep(0.3, 0.7, tile.a) * smoothstep(0.05, 0.3, wm) : smoothstep(0.45, 0.65, wm);
     float ndl = dot(n, sunDir);
     float dayF = smoothstep(-0.10, 0.12, ndl);
     // terrain relief on top of the imagery (it already holds baked shading, so blend gently)
@@ -842,17 +843,31 @@ function buildTileGeo(t, dem, zE, ex, ey) {
   t.minH = minH; t.maxH = maxH;
   return g;
 }
-function buildWaterMask(t, dem, zE, ex, ey) {
-  const M = 128, data = new Uint8Array(M * M);
-  for (let r = 0; r < M; r++) {
-    const lat = mercLat(lerp(t.y1, t.y0, (r + 0.5) / M));   // row 0 = bottom of the tile (texture v = 0)
-    for (let c = 0; c < M; c++) {
-      const h = demSample(dem, zE, ex, ey, lat, lerp(t.lonW, t.lonE, (c + 0.5) / M));
-      data[r * M + c] = h < 0.5 ? 255 : 0;
+// One RGBA texture per tile: imagery in RGB, and a pixel-accurate water mask (from the real
+// elevation data) in alpha. Keeping it in one texture avoids an extra single-channel sampler.
+const tileCanvas = document.createElement('canvas'); tileCanvas.width = tileCanvas.height = 256;
+const tileCtx = tileCanvas.getContext('2d', { willReadFrequently: true });
+function buildTileTexture(t, img, dem, zE, ex, ey) {
+  const S = 256;
+  tileCtx.clearRect(0, 0, S, S);
+  tileCtx.drawImage(img, 0, 0, S, S);
+  const src = tileCtx.getImageData(0, 0, S, S).data;
+  const data = new Uint8Array(S * S * 4);
+  for (let r = 0; r < S; r++) {
+    // DataTexture row 0 is texture v = 0 (the tile's southern edge); image row 0 is the northern edge
+    const srcRow = S - 1 - r;
+    const lat = mercLat(lerp(t.y1, t.y0, (r + 0.5) / S));
+    for (let c = 0; c < S; c++) {
+      const o = (r * S + c) * 4, i = (srcRow * S + c) * 4;
+      data[o] = src[i]; data[o + 1] = src[i + 1]; data[o + 2] = src[i + 2];
+      data[o + 3] = dem ? (demSample(dem, zE, ex, ey, lat, lerp(t.lonW, t.lonE, (c + 0.5) / S)) < 0.5 ? 255 : 0) : 0;
     }
   }
-  const tex = new THREE.DataTexture(data, M, M, THREE.RedFormat, THREE.UnsignedByteType);
-  tex.magFilter = tex.minFilter = THREE.LinearFilter; tex.needsUpdate = true;
+  const tex = new THREE.DataTexture(data, S, S, THREE.RGBAFormat, THREE.UnsignedByteType);
+  tex.generateMipmaps = true; tex.minFilter = THREE.LinearMipmapLinearFilter; tex.magFilter = THREE.LinearFilter;
+  tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  tex.colorSpace = THREE.NoColorSpace;
+  tex.needsUpdate = true;
   return tex;
 }
 async function loadTile(t) {
@@ -861,14 +876,10 @@ async function loadTile(t) {
   try {
     const [img, dem] = await Promise.all([loadImg(IMG_URL(t.z, t.x, t.y)), loadDEM(zE, ex, ey)]);
     if (!img) throw new Error('imagery');
-    const tex = new THREE.Texture(img);
-    tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
-    tex.colorSpace = THREE.NoColorSpace;
-    tex.needsUpdate = true;
+    const tex = buildTileTexture(t, img, dem.data ? dem : null, zE, ex, ey);
     const geo = buildTileGeo(t, dem.data ? dem : null, zE, ex, ey);
-    const mask = dem.data ? buildWaterMask(t, dem, zE, ex, ey) : blankTex;
     const mat = new THREE.ShaderMaterial({
-      uniforms: { ...tileU, map: { value: tex }, waterMask: { value: mask }, hasDem: { value: dem.data ? 1 : 0 } }, vertexShader: TILE_VS, fragmentShader: TILE_FS
+      uniforms: { ...tileU, map: { value: tex }, hasDem: { value: dem.data ? 1 : 0 } }, vertexShader: TILE_VS, fragmentShader: TILE_FS
     });
     t.mesh = new THREE.Mesh(geo, mat);
     t.mesh.frustumCulled = false; t.mesh.visible = false;
@@ -878,7 +889,7 @@ async function loadTile(t) {
   tileLoads--;
 }
 function freeTile(t) {
-  if (t.mesh) { tileGroup.remove(t.mesh); t.mesh.geometry.dispose(); t.mesh.material.uniforms.map.value.dispose(); if (t.mesh.material.uniforms.waterMask.value !== blankTex) t.mesh.material.uniforms.waterMask.value.dispose(); t.mesh.material.dispose(); t.mesh = null; }
+  if (t.mesh) { tileGroup.remove(t.mesh); t.mesh.geometry.dispose(); t.mesh.material.uniforms.map.value.dispose(); t.mesh.material.dispose(); t.mesh = null; }
   tiles.delete(t.k);
 }
 function visitTile(t, out) {
@@ -2200,7 +2211,7 @@ function updateCamera(dt) {
   // drifting cloud field (prevailing westerlies, sped up so motion is visible)
   U.pixAng.value = 2 * Math.tan(camera.fov * DEG / 2) / (innerHeight * renderer.getPixelRatio());
   U.windOff.value.x += dt * 0.004; U.windOff.value.z += dt * 0.0015;
-  earthU.showRadar.value = layers.radar ? 0.85 * smooth(0.012, 0.09, alt) : 0;
+  earthU.showRadar.value = layers.radar && radarPix ? 0.85 * smooth(0.012, 0.09, alt) : 0;
 }
 function updateMarkers() {
   if (pin.visible && pinLL) {
