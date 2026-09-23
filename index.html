@@ -214,13 +214,15 @@ function pad(n) { return String(n).padStart(2, '0'); }
 function hhmm(d) { return pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()); }
 function lsGet(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } }
 function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* storage unavailable */ } }
+// Timeout via Promise.race rather than an AbortSignal: some embedding hosts proxy fetch()
+// through postMessage, and an AbortSignal cannot be structured-cloned (DataCloneError).
 async function fetchJSON(url, timeout = 15000) {
-  const ctl = new AbortController();
-  const id = setTimeout(() => ctl.abort(), timeout);
+  let id;
+  const timer = new Promise((_, rej) => { id = setTimeout(() => rej(new Error('timeout')), timeout); });
   try {
-    const r = await fetch(url, { signal: ctl.signal });
+    const r = await Promise.race([fetch(url), timer]);
     if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
-    const txt = await r.text();
+    const txt = await Promise.race([r.text(), timer]);
     return JSON.parse(txt);
   } finally { clearTimeout(id); }
 }
