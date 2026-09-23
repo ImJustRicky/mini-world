@@ -585,12 +585,12 @@ float cloudDensL(vec3 p, bool detail, float lod){
   float prof = cirrus ? smoothstep(0.0, 0.35, h) * (1.0 - smoothstep(0.5, 1.0, h))
                       : smoothstep(0.0, 0.07, h) * (1.0 - smoothstep(0.4, 1.0, h));
   vec3 q = (p + windOff) / (cirrus ? 48.0 : 20.0);
-  float fade = smoothstep(4.2, 1.6, lod);
+  float fade = (1.0 - smoothstep(1.6, 4.2, lod));
   float n = mix(0.62, textureLod(noise3, q, lod).r, fade);
   float dn = remap(n * prof, 1.0 - cov * 0.96, 1.0, 0.0, 1.0);
   if(dn <= 0.0) return 0.0;
   if(detail && lod < 3.2){
-    float e = mix(0.55, textureLod(noise3, q * 4.3 + 0.37, lod + 2.1).g, smoothstep(3.2, 0.6, lod));
+    float e = mix(0.55, textureLod(noise3, q * 4.3 + 0.37, lod + 2.1).g, (1.0 - smoothstep(0.6, 3.2, lod)));
     dn = remap(dn, (1.0 - e) * 0.38, 1.0, 0.0, 1.0);
   }
   return clamp(dn, 0.0, 1.0) * (cirrus ? 0.09 : 1.0);
@@ -673,21 +673,22 @@ vec3 shadeSurface(vec3 alb, vec3 P, vec3 bn, float water, float lum, vec2 uvG, f
   vec3 col = alb * light;
   if(water > 0.01){
     // multi-scale animated waves; each octave fades before it can alias
-    float far = smoothstep(0.2, 0.004, camDist);
-    float mid = smoothstep(0.004, 0.0002, camDist);
-    float near = smoothstep(0.0003, 0.00002, camDist);
-    float r1 = snoise(n * 2600.0 + vec3(time*0.30, 0.0, time*0.25)) * far;
-    float r2 = snoise(n * 2600.0 + vec3(17.0, time*0.28, -time*0.2)) * far;
-    float r3 = snoise(n * 26000.0 + vec3(time*0.9, -time*0.7, time*0.5)) * mid;
-    float r4 = snoise(n * 26000.0 + vec3(-time*0.8, 5.0, time*0.6)) * mid;
-    float r5 = snoise(n * 240000.0 + vec3(time*2.1, time*1.7, -time*1.3)) * near;
-    float r6 = snoise(n * 240000.0 + vec3(-time*1.9, 9.0, time*1.5)) * near;
-    vec3 wn = normalize(n + 0.05 * (e * (r1 + r3 + r5) + no * (r2 + r4 + r6)));
+    float far = (1.0 - smoothstep(0.004, 0.2, camDist));
+    float mid = (1.0 - smoothstep(0.0002, 0.004, camDist));
+    float near = (1.0 - smoothstep(0.00002, 0.0003, camDist));
+    // evaluate an octave only where it contributes: 0 * NaN from huge-coordinate noise is still NaN on some GPUs
+    float rx = 0.0, ry = 0.0;
+    if(far > 0.0){ rx += snoise(n * 2600.0 + vec3(time*0.30, 0.0, time*0.25)) * far; ry += snoise(n * 2600.0 + vec3(17.0, time*0.28, -time*0.2)) * far; }
+    if(mid > 0.0){ rx += snoise(n * 26000.0 + vec3(time*0.9, -time*0.7, time*0.5)) * mid; ry += snoise(n * 26000.0 + vec3(-time*0.8, 5.0, time*0.6)) * mid; }
+    if(near > 0.0){ rx += snoise(n * 240000.0 + vec3(time*2.1, time*1.7, -time*1.3)) * near; ry += snoise(n * 240000.0 + vec3(-time*1.9, 9.0, time*1.5)) * near; }
+    if(rx != rx || ry != ry){ rx = 0.0; ry = 0.0; }
+    vec3 wn = normalize(n + 0.05 * (e * rx + no * ry));
     float fres = 0.02 + 0.98 * pow(1.0 - max(dot(wn, V), 0.0), 5.0);
     vec3 skyC = skyAmbient(ndl) * 2.4;
     vec3 R = reflect(-V, wn);
     float glint = sunGlint(R, camDist);
     vec3 wcol = mix(col, skyC, fres * 0.6) + Ts * glint * (1.0 - sh) * 1.2;
+    if(wcol.r != wcol.r || wcol.g != wcol.g || wcol.b != wcol.b) wcol = col;   // never let a driver NaN paint the sea
     col = mix(col, wcol, water);
   }
   // city lights on the night side, sharpened by the urban texture of the imagery
@@ -706,9 +707,9 @@ vec3 shadeSurface(vec3 alb, vec3 P, vec3 bn, float water, float lum, vec2 uvG, f
   float fpM = camDist * RE * 1000.0 * pixAng;
   float dM = length(fract(P * RE * 1000.0 / 14.0) - 0.5) * 14.0;
   float lamp = exp(-dM * dM / 1.2) * 3.5 + exp(-dM * dM / 12.0) * 0.4;
-  lamp = mix(lamp, 0.2, smoothstep(3.0, 12.0, fpM));
+  lamp = mix(lamp, 0.35, smoothstep(3.0, 12.0, fpM));
   vec3 points = vec3(1.0, 0.8, 0.52) * step(0.965 - 0.05 * urban, hh) * urban * lamp;
-  col += (lights * farL + points * (1.0 - farL)) * nightF * showLights * (1.0 - 0.6 * sh);
+  col += (lights * mix(0.3, 1.0, farL) + points * (1.0 - farL)) * nightF * showLights * (1.0 - 0.6 * sh);
   col += alb * vec3(1.0, 0.8, 0.6) * 0.05 * urban * (1.0 - farL) * nightF * showLights;   // sodium sky-glow on the ground
   col += alb * 0.012 * (1.0 - smoothstep(-0.1, 0.1, ndl));
   vec4 rad = texture2D(radarMap, uvG);
@@ -1587,7 +1588,7 @@ const dropMat = new THREE.ShaderMaterial({
       if(aSnow > 0.5) d = normalize(d + e * sin(time*2.3 + aSeed*40.0) * 0.000004);
       vec3 p = d * (r + aEnd * len);
       float dist = distance(cameraPosition, p);
-      vA = sin(ph*3.14159) * (1.0 - aEnd*0.7) * smoothstep(0.006, 0.0015, dist);
+      vA = sin(ph*3.14159) * (1.0 - aEnd*0.7) * (1.0 - smoothstep(0.0015, 0.006, dist));
       vSnow = aSnow;
       gl_Position = projectionMatrix*viewMatrix*vec4(p,1.0);
     }`,
@@ -1883,7 +1884,7 @@ const buildMat = new THREE.ShaderMaterial({
         float fw = 3.3, fh = 3.2;
         float fx = fract(vF.x / fw), fy = fract(vF.y / fh);
         float aa = fwidth(vF.x / fw) + fwidth(vF.y / fh);
-        float w0 = smoothstep(0.16, 0.16 + aa, fx) * smoothstep(0.84, 0.84 - aa, fx) * smoothstep(0.26, 0.26 + aa, fy) * smoothstep(0.84, 0.84 - aa, fy);
+        float w0 = smoothstep(0.16, 0.16 + aa, fx) * (1.0 - smoothstep(0.84 - aa, 0.84, fx)) * smoothstep(0.26, 0.26 + aa, fy) * (1.0 - smoothstep(0.84 - aa, 0.84, fy));
         float above = step(2.8, vF.y), wv = 1.0 - smoothstep(0.35, 0.8, aa * 2.0);   // wv: windows still resolvable
         win = w0 * above * wv;
         vec2 cell = vec2(floor(vF.x / fw), floor(vF.y / fh));
@@ -2589,7 +2590,7 @@ function makeSatPoints(cap) {
     uniforms: { pr: { value: renderer.getPixelRatio() } },
     vertexShader: `attribute vec3 aCol; attribute float aSize; uniform float pr; varying vec3 vC;
       void main(){ vC = aCol; gl_PointSize = aSize * pr; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
-    fragmentShader: `varying vec3 vC; void main(){ float d = length(gl_PointCoord - 0.5); if(d > 0.5) discard; gl_FragColor = vec4(vC, smoothstep(0.5, 0.1, d)); }`,
+    fragmentShader: `varying vec3 vC; void main(){ float d = length(gl_PointCoord - 0.5); if(d > 0.5) discard; gl_FragColor = vec4(vC, (1.0 - smoothstep(0.1, 0.5, d))); }`,
     transparent: true, depthWrite: false
   });
   const p = new THREE.Points(g, m); p.frustumCulled = false; p.renderOrder = 6;
