@@ -153,6 +153,9 @@
   <div class="sec">Traffic</div>
   <button class="chip on" data-l="flights">Aircraft<i class="sw"></i></button>
   <button class="chip on" data-l="trails">Aircraft trails<i class="sw"></i></button>
+  <button class="chip on" data-l="ships">Ships (Baltic AIS)<i class="sw"></i></button>
+  <button class="chip on" data-l="trains">Trains (Finland)<i class="sw"></i></button>
+  <button class="chip on" data-l="roadTraffic">Road speeds (NYC)<i class="sw"></i></button>
   <button class="chip on" data-l="sats">Satellites<i class="sw"></i></button>
   <button class="chip" data-l="starlink">Starlink swarm<i class="sw"></i></button>
   <button class="chip on" data-l="iss">ISS<i class="sw"></i></button>
@@ -163,6 +166,9 @@
   <div class="srow"><span class="dot load" id="dCl"></span><span class="n">Clouds</span><span class="val" id="sCl">Loading</span></div>
   <div class="srow"><span class="dot load" id="dRad"></span><span class="n">Radar</span><span class="val" id="sRad">Loading</span></div>
   <div class="srow"><span class="dot load" id="dFl"></span><span class="n">Aircraft</span><span class="val" id="sFl">Loading</span></div>
+  <div class="srow"><span class="dot idle" id="dShip"></span><span class="n">Ships</span><span class="val" id="sShip">Off</span></div>
+  <div class="srow"><span class="dot idle" id="dTrn"></span><span class="n">Trains</span><span class="val" id="sTrn">Off</span></div>
+  <div class="srow"><span class="dot idle" id="dRoad"></span><span class="n">Road speeds</span><span class="val" id="sRoad">Off</span></div>
   <div class="srow"><span class="dot load" id="dSat"></span><span class="n">Satellites</span><span class="val" id="sSat">Loading</span></div>
   <div class="srow"><span class="dot idle" id="dMap"></span><span class="n">Map data</span><span class="val" id="sMap">Zoom in</span></div>
   <div id="astro"></div>
@@ -186,7 +192,7 @@
 <div id="tag"></div>
 <div id="tip" class="glass"></div>
 <div id="toast" class="glass"></div>
-<div id="credit">Imagery © Esri, Maxar, Earthstar · Sentinel-2 cloudless by EOX · Terrain © Mapzen/AWS · Clouds NASA GIBS (GOES, Himawari) · Weather Open-Meteo · © OpenStreetMap contributors · Orbits CelesTrak</div>
+<div id="credit">Imagery © Esri, Maxar, Earthstar · Sentinel-2 cloudless by EOX · Terrain © Mapzen/AWS · Clouds NASA GIBS (GOES, Himawari) · Weather Open-Meteo · © OpenStreetMap contributors · Orbits CelesTrak · Ships &amp; trains Fintraffic/Digitraffic (CC BY 4.0) · Road speeds NYC DOT</div>
 <div id="loader"><div class="ring"></div></div>
 
 <script type="module">
@@ -247,16 +253,16 @@ function lsGet(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e
 function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* storage unavailable or full */ } }
 // Timeout via Promise.race rather than an AbortSignal: some embedding hosts proxy fetch()
 // through postMessage, and an AbortSignal cannot be structured-cloned (DataCloneError).
-async function fetchText(url, timeout = 15000) {
+async function fetchText(url, timeout = 15000, init) {
   let id;
   const timer = new Promise((_, rej) => { id = setTimeout(() => rej(new Error('timeout')), timeout); });
   try {
-    const r = await Promise.race([fetch(url), timer]);
+    const r = await Promise.race([init ? fetch(url, init) : fetch(url), timer]);
     if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
     return await Promise.race([r.text(), timer]);
   } finally { clearTimeout(id); }
 }
-async function fetchJSON(url, timeout = 15000) { return JSON.parse(await fetchText(url, timeout)); }
+async function fetchJSON(url, timeout = 15000, init) { return JSON.parse(await fetchText(url, timeout, init)); }
 function loadImg(src, timeout = 30000) {
   return new Promise(res => {
     const im = new Image(); im.crossOrigin = 'anonymous';
@@ -693,16 +699,16 @@ vec3 shadeSurface(vec3 alb, vec3 P, vec3 bn, float water, float lum, vec2 uvG, f
   }
   // city lights on the night side, sharpened by the urban texture of the imagery
   float nl = dot(texture2D(nightMap, uvG).rgb, vec3(0.3, 0.5, 0.2));
-  vec3 lights = vec3(1.0, 0.78, 0.48) * max(nl - 0.16, 0.0) * 2.6 * (1.0 - water);
+  vec3 lights = vec3(1.0, 0.78, 0.48) * max(nl - 0.1, 0.0) * 2.4 * (1.0 - water);   // low cut keeps mid-size cities lit
   lights *= 0.6 + 1.2 * smoothstep(0.15, 0.4, lum);
   float nightF = 1.0 - smoothstep(-0.14, 0.02, ndl);
   // the lights texture is ~2 km per pixel: from orbit it's the city glow, but at street level it would paint whole
   // districts orange, so there it gives way to scattered point lights (streets draw their own lamp pools)
-  float farL = smoothstep(0.0006, 0.004, camDist);
+  float farL = smoothstep(0.00018, 0.0012, camDist);   // hand over to lamps only below ~1-8 km, where streets are drawn
   vec3 cellP = floor(P * RE * 1000.0 / 14.0);
   vec3 hp = fract(cellP * vec3(0.1031, 0.1030, 0.0973)); hp += dot(hp, hp.yxz + 33.33);
   float hh = fract((hp.x + hp.y) * hp.z);
-  float urban = smoothstep(0.12, 0.45, nl);
+  float urban = smoothstep(0.08, 0.36, nl);
   // each lamp is a ~2 m source with a soft pool; once lamps are sub-pixel, use their average brightness
   float fpM = camDist * RE * 1000.0 * pixAng;
   float dM = length(fract(P * RE * 1000.0 / 14.0) - 0.5) * 14.0;
@@ -2571,6 +2577,344 @@ function updateFlights() {
 }
 
 /* =====================================================================
+   SURFACE TRAFFIC — only feeds that are genuinely live, open and browser-readable:
+   ships (Baltic AIS) and trains (Finnish rail GPS) from Fintraffic Digitraffic,
+   road speeds from NYC DOT's real-time traffic sensors
+   ===================================================================== */
+const DT_HEAD = { headers: { 'Digitraffic-User': 'MiniWorld/1.0' } };
+function surfPredict(o, now, cap) {
+  const dt = clamp(now - o.t, 0, cap);
+  if (o.v < 0.3) { _pLat = o.lat; _pLon = o.lon; return; }
+  const d = o.v * dt / EARTH_M, p1 = o.lat * DEG, b = o.hd * DEG;
+  const sp = Math.sin(p1), cp = Math.cos(p1), sd = Math.sin(d), cd = Math.cos(d);
+  const p2 = Math.asin(sp * cd + cp * sd * Math.cos(b));
+  _pLat = p2 / DEG;
+  _pLon = wrapLon(o.lon + Math.atan2(Math.sin(b) * sd * cp, cd - sp * Math.sin(p2)) / DEG);
+}
+function bearing(la1, lo1, la2, lo2) {
+  const p1 = la1 * DEG, p2 = la2 * DEG, dl = (lo2 - lo1) * DEG;
+  return (Math.atan2(Math.sin(dl) * Math.cos(p2), Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl)) / DEG + 360) % 360;
+}
+function haversineM(la1, lo1, la2, lo2) {
+  const a = Math.sin((la2 - la1) * DEG / 2) ** 2 + Math.cos(la1 * DEG) * Math.cos(la2 * DEG) * Math.sin((lo2 - lo1) * DEG / 2) ** 2;
+  return 2 * EARTH_M * Math.asin(Math.min(1, Math.sqrt(a)));
+}
+function emissiveStd() {
+  const m = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.6, metalness: 0.1 });
+  m.onBeforeCompile = sh => { sh.fragmentShader = sh.fragmentShader.replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\n totalEmissiveRadiance = vColor * 0.45;'); };
+  return m;
+}
+
+/* ---------- ships ---------- */
+function shipGeometry() {             // 1 unit long hull, bow toward +z
+  const hull = new THREE.BoxGeometry(0.17, 0.08, 0.82); hull.translate(0, 0.04, -0.09);
+  const bow = new THREE.ConeGeometry(0.085, 0.18, 4); bow.rotateX(Math.PI / 2); bow.rotateZ(Math.PI / 4); bow.scale(1, 0.47, 1); bow.translate(0, 0.04, 0.41);
+  const house = new THREE.BoxGeometry(0.13, 0.09, 0.12); house.translate(0, 0.12, -0.36);
+  const g = mergeGeometries([hull, bow, house].map(p => p.toNonIndexed()));
+  g.computeVertexNormals();
+  return g;
+}
+const MAX_SHIP = 6000;
+const shipMesh = new THREE.InstancedMesh(shipGeometry(), emissiveStd(), MAX_SHIP);
+shipMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+shipMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_SHIP * 3), 3);
+shipMesh.count = 0; shipMesh.frustumCulled = false;
+scene.add(shipMesh);
+const ships = new Map(), shipMeta = new Map();
+let shipOkAt = 0, trainOkAt = 0;
+let shipArr = [];
+const shipPos = new Float32Array(MAX_SHIP * 3);
+const NAV_STAT = ['Under way (engine)', 'At anchor', 'Not under command', 'Restricted manoeuvrability', 'Constrained by draught', 'Moored', 'Aground', 'Fishing', 'Under way (sailing)', '', '', 'Towing astern', 'Pushing ahead', '', 'AIS-SART active', ''];
+function shipKind(t) {
+  if (t >= 60 && t <= 69) return ['Passenger', [0.45, 0.72, 1]];
+  if (t >= 70 && t <= 79) return ['Cargo', [0.55, 0.9, 0.55]];
+  if (t >= 80 && t <= 89) return ['Tanker', [1, 0.5, 0.42]];
+  if (t >= 40 && t <= 49) return ['High-speed craft', [0.9, 0.6, 1]];
+  if (t === 30) return ['Fishing', [1, 0.72, 0.35]];
+  if (t === 52 || t === 31 || t === 32) return ['Tug', [1, 0.9, 0.4]];
+  if (t === 50) return ['Pilot vessel', [1, 0.9, 0.4]];
+  if (t === 51) return ['Search & rescue', [1, 0.4, 0.4]];
+  if (t === 35) return ['Military', [0.75, 0.75, 0.75]];
+  if (t === 36) return ['Sailing', [0.95, 0.95, 0.95]];
+  if (t === 37) return ['Pleasure craft', [0.95, 0.95, 0.95]];
+  if (t === 33) return ['Dredger', [0.85, 0.75, 0.55]];
+  return ['Vessel', [0.8, 0.82, 0.86]];
+}
+let shipMetaAt = 0;
+async function loadShipMeta() {
+  if (Date.now() - shipMetaAt < 30 * 60 * 1000) return;
+  shipMetaAt = Date.now();
+  try {
+    const d = await fetchJSON('https://meri.digitraffic.fi/api/ais/v1/vessels', 30000, DT_HEAD);
+    for (const v of d) shipMeta.set(v.mmsi, v);
+  } catch (e) { shipMetaAt = 0; }
+}
+async function pollShips() {
+  if (!layers.ships) return;
+  loadShipMeta();
+  try {
+    const d = await fetchJSON('https://meri.digitraffic.fi/api/ais/v1/locations', 30000, DT_HEAD);
+    const seen = new Set();
+    for (const f of d.features || []) {
+      const p = f.properties || {}, c = f.geometry?.coordinates;
+      if (!c || !isFinite(c[0]) || !isFinite(c[1])) continue;
+      const hd = p.heading >= 0 && p.heading < 360 ? p.heading : (p.cog >= 0 && p.cog < 360 ? p.cog : 0);
+      // the feed keeps last-known positions for hours: show only fresh fixes (moving 20 min, moored/anchored 2 h)
+      const tFix = (p.timestampExternal || 0) / 1000, ageS = Date.now() / 1000 - tFix;
+      const still = p.navStat === 1 || p.navStat === 5 || !(p.sog > 0.5);
+      if (!tFix || ageS > (still ? 7200 : 1200)) { ships.delete(p.mmsi); continue; }
+      const o = ships.get(p.mmsi) || { mmsi: p.mmsi };
+      o.lat = c[1]; o.lon = c[0]; o.hd = hd; o.cog = p.cog; o.sog = p.sog >= 0 && p.sog < 102.3 ? p.sog : 0;
+      o.v = o.sog * 0.514444; o.nav = p.navStat; o.t = (p.timestampExternal || Date.now()) / 1000;
+      ships.set(p.mmsi, o); seen.add(p.mmsi);
+    }
+    const cut = Date.now() / 1000 - 1200;
+    for (const [k, o] of ships) if (!seen.has(k) && o.t < cut) ships.delete(k);
+    shipArr = [...ships.values()].slice(0, MAX_SHIP);
+    shipMesh.count = shipArr.length;
+    shipOkAt = Date.now();
+    setStatus('Ship', 'ok', shipArr.length.toLocaleString() + ' live · Baltic');
+  } catch (e) {
+    // one failed poll is a network hiccup, not an outage: keep the fresh data and say so only once it goes stale
+    if (Date.now() - shipOkAt > 5 * 60 * 1000) setStatus('Ship', 'err', 'Unavailable');
+    else setStatus('Ship', 'load', shipArr.length.toLocaleString() + ' live · retrying');
+    $('#sShip').title = String(e && e.message || e);
+  }
+}
+function updateShips() {
+  if (!shipMesh.visible || !shipArr.length) return;
+  const now = Date.now() / 1000, m = shipMesh.instanceMatrix.array, col = shipMesh.instanceColor.array, cp = camera.position;
+  for (let i = 0; i < shipArr.length; i++) {
+    const o = shipArr[i], meta = shipMeta.get(o.mmsi);
+    surfPredict(o, now, 900);
+    o.cLat = _pLat; o.cLon = _pLon;
+    planeFrame(_pLat, _pLon, 1 + 1.5 * TERRAIN_K, o.hd, _p);
+    const len = meta && meta.referencePointA + meta.referencePointB > 4 ? meta.referencePointA + meta.referencePointB : 60;
+    const dist = _p.distanceTo(cp);
+    let s = Math.max(dist * 0.009, len * TERRAIN_K);
+    if (o === cardObj) s *= 1.6;
+    const q = i * 16;
+    m[q] = _r.x * s; m[q + 1] = _r.y * s; m[q + 2] = _r.z * s; m[q + 3] = 0;
+    m[q + 4] = _n.x * s; m[q + 5] = _n.y * s; m[q + 6] = _n.z * s; m[q + 7] = 0;
+    m[q + 8] = _f.x * s; m[q + 9] = _f.y * s; m[q + 10] = _f.z * s; m[q + 11] = 0;
+    m[q + 12] = _p.x; m[q + 13] = _p.y; m[q + 14] = _p.z; m[q + 15] = 1;
+    shipPos[i * 3] = _p.x; shipPos[i * 3 + 1] = _p.y; shipPos[i * 3 + 2] = _p.z;
+    const c = shipKind(meta ? meta.shipType : 0)[1];
+    col[i * 3] = c[0]; col[i * 3 + 1] = c[1]; col[i * 3 + 2] = c[2];
+  }
+  shipMesh.instanceMatrix.needsUpdate = true; shipMesh.instanceColor.needsUpdate = true;
+}
+
+/* ---------- trains ---------- */
+function trainGeometry() {             // 1 unit long trainset, front toward +z
+  const body = new THREE.BoxGeometry(0.035, 0.03, 0.96); body.translate(0, 0.02, 0);
+  const nose = new THREE.ConeGeometry(0.0175, 0.04, 4); nose.rotateX(Math.PI / 2); nose.rotateZ(Math.PI / 4); nose.translate(0, 0.02, 0.5);
+  const g = mergeGeometries([body, nose].map(p => p.toNonIndexed()));
+  g.computeVertexNormals();
+  return g;
+}
+const MAX_TRAIN = 1500;
+const trainMesh = new THREE.InstancedMesh(trainGeometry(), emissiveStd(), MAX_TRAIN);
+trainMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+trainMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_TRAIN * 3), 3);
+trainMesh.count = 0; trainMesh.frustumCulled = false;
+scene.add(trainMesh);
+const trains = new Map();
+let trainArr = [];
+const trainPos = new Float32Array(MAX_TRAIN * 3);
+const trainInfo = new Map();
+let stationNames = null;
+async function pollTrains() {
+  if (!layers.trains) return;
+  try {
+    const d = await fetchJSON('https://rata.digitraffic.fi/api/v1/train-locations/latest', 20000, DT_HEAD);
+    const seen = new Set();
+    for (const r of d) {
+      const c = r.location?.coordinates; if (!c) continue;
+      const k = r.trainNumber + '|' + r.departureDate;
+      const o = trains.get(k) || { key: k, num: r.trainNumber, date: r.departureDate, hd: 0 };
+      if (o.lat != null) {
+        const moved = haversineM(o.lat, o.lon, c[1], c[0]);
+        if (moved > 25) o.hd = bearing(o.lat, o.lon, c[1], c[0]);
+      }
+      o.lat = c[1]; o.lon = c[0]; o.kmh = r.speed || 0; o.v = o.kmh / 3.6; o.t = Date.parse(r.timestamp) / 1000 || Date.now() / 1000;
+      trains.set(k, o); seen.add(k);
+    }
+    for (const k of trains.keys()) if (!seen.has(k)) trains.delete(k);
+    trainArr = [...trains.values()].slice(0, MAX_TRAIN);
+    trainMesh.count = trainArr.length;
+    trainOkAt = Date.now();
+    setStatus('Trn', 'ok', trainArr.length.toLocaleString() + ' live · Finland');
+  } catch (e) {
+    if (Date.now() - trainOkAt > 2 * 60 * 1000) { setStatus('Trn', 'err', 'Unavailable'); trainArr = []; trainMesh.count = 0; }
+    else setStatus('Trn', 'load', trainArr.length.toLocaleString() + ' live · retrying');
+    $('#sTrn').title = String(e && e.message || e);
+  }
+}
+function updateTrains() {
+  if (!trainMesh.visible || !trainArr.length) return;
+  const now = Date.now() / 1000, m = trainMesh.instanceMatrix.array, col = trainMesh.instanceColor.array, cp = camera.position;
+  for (let i = 0; i < trainArr.length; i++) {
+    const o = trainArr[i];
+    surfPredict(o, now, 20);          // tracks curve: extrapolate only until the next GPS fix
+    o.cLat = _pLat; o.cLon = _pLon;
+    planeFrame(_pLat, _pLon, surfaceR(_pLat, _pLon) + 2.5 * TERRAIN_K, o.hd, _p);
+    const dist = _p.distanceTo(cp);
+    let s = Math.max(dist * 0.03, 160 * TERRAIN_K);
+    if (o === cardObj) s *= 1.5;
+    const q = i * 16;
+    m[q] = _r.x * s; m[q + 1] = _r.y * s; m[q + 2] = _r.z * s; m[q + 3] = 0;
+    m[q + 4] = _n.x * s; m[q + 5] = _n.y * s; m[q + 6] = _n.z * s; m[q + 7] = 0;
+    m[q + 8] = _f.x * s; m[q + 9] = _f.y * s; m[q + 10] = _f.z * s; m[q + 11] = 0;
+    m[q + 12] = _p.x; m[q + 13] = _p.y; m[q + 14] = _p.z; m[q + 15] = 1;
+    trainPos[i * 3] = _p.x; trainPos[i * 3 + 1] = _p.y; trainPos[i * 3 + 2] = _p.z;
+    const info = trainInfo.get(o.key), comm = info && info.commuterLineID;
+    const c = comm ? [0.55, 0.95, 0.6] : info && info.trainCategory === 'Cargo' ? [0.8, 0.7, 0.55] : [1, 0.85, 0.35];
+    col[i * 3] = c[0]; col[i * 3 + 1] = c[1]; col[i * 3 + 2] = c[2];
+  }
+  trainMesh.instanceMatrix.needsUpdate = true; trainMesh.instanceColor.needsUpdate = true;
+}
+async function trainDetails(o) {
+  if (trainInfo.has(o.key)) return trainInfo.get(o.key);
+  if (!stationNames) {
+    try {
+      const st = await fetchJSON('https://rata.digitraffic.fi/api/v1/metadata/stations', 20000, DT_HEAD);
+      stationNames = new Map(st.map(s => [s.stationShortCode, s.stationName.replace(/ asema$/, '')]));
+    } catch (e) { stationNames = null; }
+  }
+  const d = await fetchJSON(`https://rata.digitraffic.fi/api/v1/trains/${o.date}/${o.num}`, 20000, DT_HEAD);
+  const t = d && d[0];
+  if (!t) return null;
+  const rows = t.timeTableRows || [];
+  const nm = c => (stationNames && stationNames.get(c)) || c;
+  const next = rows.find(r => r.type === 'ARRIVAL' && !r.actualTime && r.commercialStop);
+  const last = [...rows].reverse().find(r => r.actualTime);
+  const info = {
+    type: t.trainType, category: t.trainCategory, commuterLineID: t.commuterLineID, operator: (t.operatorShortCode || '').toUpperCase(),
+    from: rows[0] ? nm(rows[0].stationShortCode) : '', to: rows.length ? nm(rows[rows.length - 1].stationShortCode) : '',
+    next: next ? { name: nm(next.stationShortCode), time: next.liveEstimateTime || next.scheduledTime } : null,
+    delay: last ? last.differenceInMinutes : null, cancelled: t.cancelled
+  };
+  trainInfo.set(o.key, info);
+  return info;
+}
+
+/* ---------- NYC real-time road speeds ---------- */
+const nycGroup = new THREE.Group();
+scene.add(nycGroup);
+let nycLinks = [], nycAsOf = null, nycBusy = false;
+const nycMat = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.9, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8 });
+function decodePolyline(s) {
+  const out = []; let i = 0, lat = 0, lon = 0;
+  while (i < s.length) {
+    for (let k = 0; k < 2; k++) {
+      let b, sh = 0, r = 0;
+      do { b = s.charCodeAt(i++) - 63; r |= (b & 31) << sh; sh += 5; } while (b >= 32 && i < s.length);
+      const d = r & 1 ? ~(r >> 1) : r >> 1;
+      if (k === 0) lat += d; else lon += d;
+    }
+    out.push([lat / 1e5, lon / 1e5]);
+  }
+  return out;
+}
+const inNYC = ([la, lo]) => la > 40.4 && la < 41.0 && lo > -74.35 && lo < -73.6;
+function speedCol(mph) { return mph < 10 ? [0.93, 0.2, 0.2] : mph < 20 ? [1, 0.55, 0.15] : mph < 35 ? [1, 0.85, 0.2] : [0.25, 0.85, 0.4]; }
+function nycNowFloating() { return Date.parse(new Date().toLocaleString('sv-SE', { timeZone: 'America/New_York' }).replace(' ', 'T')); }
+function buildNYCMesh() {
+  for (const c of nycGroup.children) c.geometry.dispose();
+  nycGroup.clear();
+  if (!nycLinks.length) return;
+  const origin = new THREE.Vector3(); ll2v(40.73, -73.93, 1, origin);
+  const P = [], C = [], W = 16 * TERRAIN_K, a = new THREE.Vector3(), b = new THREE.Vector3(), up = new THREE.Vector3(), side = new THREE.Vector3();
+  for (const L of nycLinks) {
+    const col = speedCol(L.mph), pts = L.pts;
+    for (let i = 0; i + 1 < pts.length; i++) {
+      ll2v(pts[i][0], pts[i][1], surfaceR(pts[i][0], pts[i][1]) + 3 * TERRAIN_K, a);
+      ll2v(pts[i + 1][0], pts[i + 1][1], surfaceR(pts[i + 1][0], pts[i + 1][1]) + 3 * TERRAIN_K, b);
+      up.copy(a).normalize(); side.subVectors(b, a).cross(up);
+      if (side.lengthSq() < 1e-20) continue;
+      side.normalize().multiplyScalar(W / 2);
+      const v = [a.clone().add(side), a.clone().sub(side), b.clone().add(side), b.clone().sub(side)].map(x => x.sub(origin));
+      for (const k of [0, 1, 2, 2, 1, 3]) { P.push(v[k].x, v[k].y, v[k].z); C.push(col[0], col[1], col[2]); }
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(P, 3));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(C, 3));
+  const mesh = new THREE.Mesh(g, nycMat);
+  mesh.position.copy(origin); mesh.frustumCulled = false; mesh.renderOrder = 2;
+  nycGroup.add(mesh);
+}
+async function pollNYC() {
+  if (!layers.roadTraffic || nycBusy) return;
+  nycBusy = true;
+  try {
+    const d = await fetchJSON('https://data.cityofnewyork.us/resource/i4gi-tjb9.json?$select=link_id,speed,travel_time,data_as_of,link_points,encoded_poly_line,borough,link_name&$order=data_as_of%20DESC&$limit=1500', 30000);
+    const latest = new Map();
+    for (const r of d) if (!latest.has(r.link_id)) latest.set(r.link_id, r);
+    const links = [];
+    for (const r of latest.values()) {
+      let pts = [];
+      try { pts = r.encoded_poly_line ? decodePolyline(r.encoded_poly_line.replace(/\\\\/g, '\\')) : []; } catch (e) { pts = []; }
+      if (pts.length < 2 || !pts.every(inNYC)) pts = String(r.link_points || '').split(' ').map(s => s.split(',').map(Number)).filter(p => p.length === 2 && isFinite(p[0]) && isFinite(p[1]) && inNYC(p));
+      if (pts.length < 2) continue;
+      links.push({ id: r.link_id, name: r.link_name || 'Road segment', borough: r.borough || '', mph: +r.speed || 0, tt: +r.travel_time || 0, asOf: Date.parse(r.data_as_of), pts });
+    }
+    nycLinks = links;
+    nycAsOf = links.length ? Math.max(...links.map(l => l.asOf)) : null;
+    buildNYCMesh();
+    nycStatus();
+    nycMat.opacity = nycAgeMin(nycAsOf) > 60 ? 0.4 : 0.9;     // old readings are shown faded, never as if current
+  } catch (e) { setStatus('Road', 'err', 'Unavailable'); }
+  nycBusy = false;
+}
+function nycAgeMin(t) { return t ? Math.max(0, Math.round((nycNowFloating() - t) / 60000)) : null; }
+function fmtAge(min) { return min == null ? '' : min < 90 ? min + ' min old' : Math.round(min / 60) + ' h old'; }
+function nycStatus() {
+  if (!nycAsOf) { setStatus('Road', 'err', 'No data'); return; }
+  const age = nycAgeMin(nycAsOf), d = new Date(nycAsOf);
+  setStatus('Road', age > 45 ? 'idle' : 'ok', `NYC · ${nycLinks.length} links · ${pad(d.getHours())}:${pad(d.getMinutes())} (${fmtAge(age)})`);
+}
+function pickNYC(x, y, radius = 9) {
+  if (!nycGroup.visible || !nycLinks.length) return null;
+  const v = new THREE.Vector3();
+  let best = null, bd = radius * radius;
+  for (const L of nycLinks) {
+    let prev = null;
+    for (const p of L.pts) {
+      ll2v(p[0], p[1], surfaceR(p[0], p[1]), v);
+      const s = screenOf(v);
+      if (s && prev) {
+        const dx = s[0] - prev[0], dy = s[1] - prev[1], l2 = dx * dx + dy * dy;
+        const t = l2 > 0 ? clamp(((x - prev[0]) * dx + (y - prev[1]) * dy) / l2, 0, 1) : 0;
+        const d = (prev[0] + t * dx - x) ** 2 + (prev[1] + t * dy - y) ** 2;
+        if (d < bd && !occluded(v)) { bd = d; best = L; }
+      }
+      prev = s;
+    }
+  }
+  return best;
+}
+function pickInstances(arr, pos, x, y, radius = 12) {
+  let best = null, bd = radius * radius;
+  const v = new THREE.Vector3();
+  for (let i = 0; i < arr.length; i++) {
+    v.set(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]);
+    const s = screenOf(v); if (!s) continue;
+    const d = (s[0] - x) ** 2 + (s[1] - y) ** 2;
+    if (d < bd && !occluded(v)) { bd = d; best = arr[i]; }
+  }
+  return best;
+}
+function updateSurfaceTraffic(alt) {
+  shipMesh.visible = layers.ships && alt < 0.35;
+  trainMesh.visible = layers.trains && alt < 0.35;
+  nycGroup.visible = layers.roadTraffic && alt < 0.02;
+  updateShips();
+  updateTrains();
+}
+
+/* =====================================================================
    SPACE TRAFFIC: every tracked satellite from live CelesTrak orbital elements (SGP4)
    ===================================================================== */
 let SATLIB = null;
@@ -2927,8 +3271,14 @@ function clickAt(x, y) {
   if (pickISS(x, y)) { setMode('iss'); return; }
   const p = pickPlane(x, y);
   if (p) { selected = p; setMode('plane', false, true); return; }
+  const sh = shipMesh.visible ? pickInstances(shipArr, shipPos, x, y) : null;
+  if (sh) { showShipCard(sh); return; }
+  const tr = trainMesh.visible ? pickInstances(trainArr, trainPos, x, y) : null;
+  if (tr) { showTrainCard(tr); return; }
   const s = pickSat(x, y);
   if (s) { showSatCard(s); return; }
+  const rl = pickNYC(x, y);
+  if (rl) { showNYCCard(rl); return; }
   const b = pickBuilding(x, y);
   if (b) { showBuildingCard(b); return; }
   const g = pickGround(x, y);
@@ -3117,6 +3467,55 @@ function renderFlightCard(f) {
     <div class="meta"><span>${fmtLat(f.cLat ?? f.lat)} ${fmtLon(f.cLon ?? f.lon)} · ${esc(f.src)} · ${Math.max(0, Math.round(Date.now() / 1000 - f.t))} s ago</span></div>
     <div class="meta"><a href="https://globe.adsbexchange.com/?icao=${esc(f.hex)}" target="_blank" rel="noopener">Track ↗</a><button onclick="window.__nextPlane()">Next plane</button></div>`;
 }
+function showShipCard(o) { pinLL = null; pin.visible = false; openCard('ship', '', o); renderShipCard(o); }
+function renderShipCard(o) {
+  const meta = shipMeta.get(o.mmsi), [kind] = shipKind(meta ? meta.shipType : 0);
+  const len = meta && meta.referencePointA + meta.referencePointB > 4 ? meta.referencePointA + meta.referencePointB : null;
+  const beam = meta && meta.referencePointC + meta.referencePointD > 1 ? meta.referencePointC + meta.referencePointD : null;
+  const age = Math.max(0, Math.round(Date.now() / 1000 - o.t));
+  card.innerHTML = X + `
+    <div class="k">${esc(kind)}${meta && meta.callSign ? ' · ' + esc(meta.callSign) : ''}</div>
+    <div class="h">${esc(meta && meta.name ? meta.name.trim() : 'MMSI ' + o.mmsi)}</div>
+    <div class="big">${o.sog.toFixed(1)}<small>kn · ${(o.sog * 1.852).toFixed(0)} km/h</small></div>
+    <div class="stats"><span><b>${Math.round(o.hd)}°</b> ${compass(o.hd)}</span><span>${esc(NAV_STAT[o.nav] || 'Status not reported')}</span>
+      ${len ? `<span><b>${len}</b> m long${beam ? ' · ' + beam + ' m beam' : ''}</span>` : ''}${meta && meta.draught ? `<span><b>${(meta.draught / 10).toFixed(1)}</b> m draught</span>` : ''}</div>
+    ${meta && meta.destination && meta.destination.trim() ? `<div class="meta"><span>Bound for <b>${esc(meta.destination.trim())}</b></span></div>` : ''}
+    <div class="meta"><span>${fmtLat(o.cLat ?? o.lat)} ${fmtLon(o.cLon ?? o.lon)} · AIS ${age < 120 ? age + ' s' : Math.round(age / 60) + ' min'} ago · MMSI ${o.mmsi}</span></div>
+    <div class="meta"><span>Fintraffic / Digitraffic, CC BY 4.0</span><a href="https://www.marinetraffic.com/en/ais/details/ships/mmsi:${o.mmsi}" target="_blank" rel="noopener">Track ↗</a></div>`;
+}
+async function showTrainCard(o) {
+  pinLL = null; pin.visible = false;
+  openCard('trn', '', o); renderTrainCard(o, trainInfo.get(o.key));
+  if (!trainInfo.has(o.key)) {
+    let info = null;
+    try { info = await trainDetails(o); } catch (e) { info = null; }
+    if (cardObj === o) renderTrainCard(o, info);
+  }
+}
+function renderTrainCard(o, info) {
+  const age = Math.max(0, Math.round(Date.now() / 1000 - o.t));
+  const name = info ? (info.commuterLineID ? info.commuterLineID + ' train ' + o.num : (info.type || 'Train') + ' ' + o.num) : 'Train ' + o.num;
+  const hm = t => { const d = new Date(t); return d.toLocaleTimeString('en-GB', { timeZone: 'Europe/Helsinki', hour: '2-digit', minute: '2-digit' }); };
+  card.innerHTML = X + `
+    <div class="k">${esc(info ? [info.category, info.operator].filter(Boolean).join(' · ') : 'Finnish rail')}</div>
+    <div class="h">${esc(name)}</div>
+    ${info && info.from ? `<div class="stats"><span><b>${esc(info.from)}</b> → <b>${esc(info.to)}</b></span></div>` : '<div class="meta"><span>Looking up the timetable…</span></div>'}
+    <div class="big">${Math.round(o.kmh)}<small>km/h${o.kmh > 1 ? ' · heading ' + compass(o.hd) : ' · stopped'}</small></div>
+    <div class="stats">${info && info.next ? `<span>Next stop <b>${esc(info.next.name)}</b> ${hm(info.next.time)}</span>` : ''}${info && info.delay != null ? `<span><b>${info.delay > 0 ? '+' + info.delay : info.delay}</b> min vs timetable</span>` : ''}</div>
+    <div class="meta"><span>${fmtLat(o.cLat ?? o.lat)} ${fmtLon(o.cLon ?? o.lon)} · GPS ${age} s ago</span></div>
+    <div class="meta"><span>Fintraffic / Digitraffic, CC BY 4.0</span></div>`;
+}
+function showNYCCard(L) {
+  pinLL = null; pin.visible = false;
+  const d = new Date(L.asOf), age = nycAgeMin(L.asOf);
+  openCard('nyc', `
+    <div class="k">Road traffic · ${esc(L.borough)}</div>
+    <div class="h">${esc(L.name)}</div>
+    <div class="big">${Math.round(L.mph)}<small>mph · ${Math.round(L.mph * 1.609)} km/h</small></div>
+    <div class="stats"><span>Segment travel time <b>${Math.floor(L.tt / 60)}:${pad(Math.round(L.tt % 60))}</b></span></div>
+    <div class="meta"><span>Measured ${pad(d.getHours())}:${pad(d.getMinutes())} New York time · ${fmtAge(age)}</span></div>
+    <div class="meta"><span>NYC DOT real-time traffic speed sensors</span></div>`, L);
+}
 function showISSCard() { pin.visible = false; openCard('iss', ''); renderISSCard(); }
 function renderISSCard() {
   if (!issNow) return;
@@ -3188,7 +3587,7 @@ async function showBuildingCard(b) {
 /* =====================================================================
    UI: layers, search, settings, clock
    ===================================================================== */
-const layers = { clouds: true, radar: true, rain: true, wind: false, temp: false, buildings: true, roads: true, landmarks: true, labels: true, lights: true, flights: true, trails: true, sats: true, starlink: false, iss: true };
+const layers = { clouds: true, radar: true, rain: true, wind: false, temp: false, buildings: true, roads: true, landmarks: true, labels: true, lights: true, flights: true, trails: true, ships: true, trains: true, roadTraffic: true, sats: true, starlink: false, iss: true };
 function applyLayers() {
   cloudShell.visible = layers.clouds;
   surfU.showRadar.value = layers.radar ? 1 : 0; surfU.showTemp.value = layers.temp ? 1 : 0; surfU.showLights.value = layers.lights ? 1 : 0;
@@ -3199,6 +3598,9 @@ function applyLayers() {
   iss.visible = layers.iss && !!issNow;
   satPoints.visible = layers.sats; starPoints.visible = layers.starlink;
   if (layers.starlink) loadStarlink();
+  if (layers.ships && !shipArr.length) pollShips();
+  if (layers.trains && !trainArr.length) pollTrains();
+  if (layers.roadTraffic && !nycLinks.length) pollNYC();
   $('#legend').style.display = layers.temp ? 'block' : 'none';
 }
 function syncChips() { document.querySelectorAll('.chip').forEach(c => c.classList.toggle('on', !!layers[c.dataset.l])); applyLayers(); }
@@ -3248,6 +3650,8 @@ function updateClock(now) {
   const waxing = ((m.lon - s.lon + 540) % 360 - 180) > 0;
   $('#astro').innerHTML = `Sun overhead ${fmtLat(s.lat)} ${fmtLon(s.lon)}<br>Moon ${illum}% lit, ${waxing ? 'waxing' : 'waning'} · 384,400 km`;
   if (cardKind === 'fl' && cardObj) renderFlightCard(cardObj);
+  if (cardKind === 'ship' && cardObj && Math.floor(now / 1000) !== Math.floor((now - 250) / 1000)) renderShipCard(cardObj);
+  if (cardKind === 'trn' && cardObj && Math.floor(now / 1000) !== Math.floor((now - 250) / 1000)) renderTrainCard(cardObj, trainInfo.get(cardObj.key));
   if (cardKind === 'iss' && Math.floor(now / 1000) !== Math.floor((now - 250) / 1000)) renderISSCard();
   if (cardKind === 'sat' && cardObj && Math.floor(now / 1000) !== Math.floor((now - 250) / 1000)) renderSatCard(cardObj);
 }
@@ -3365,6 +3769,7 @@ function frame() {
   const focus = focusLatLon();
   updateMapData(now, alt, focus);
   updateFlights();
+  updateSurfaceTraffic(alt);
   updateSatellites();
   updateISS();
   updateWind(dt);
@@ -3383,7 +3788,7 @@ function frame() {
 /* =====================================================================
    BOOT
    ===================================================================== */
-if (/[?&]debug\b/.test(location.search)) window.__mw = { flyTo, cam, camera, tiles, wikiNear, get alt() { return camera.position.length() - 1; } };
+if (/[?&]debug\b/.test(location.search)) window.__mw = { flyTo, cam, camera, tiles, wikiNear, get shipArr() { return shipArr; }, get trainArr() { return trainArr; }, get nycLinks() { return nycLinks; }, showShipCard, showTrainCard, showNYCCard, get alt() { return camera.position.length() - 1; } };
 (async function boot() {
   const [day, night, topo, water] = await Promise.all([
     loadTex('earth-blue-marble.jpg', solidTex(18, 52, 96)), loadTex('earth-night.jpg', solidTex(0, 0, 0)),
@@ -3403,6 +3808,10 @@ if (/[?&]debug\b/.test(location.search)) window.__mw = { flyTo, cam, camera, til
   setInterval(() => loadWeather(), 60 * 60 * 1000);
   setInterval(() => loadRadar(), 10 * 60 * 1000);
   setInterval(() => loadClouds(), 15 * 60 * 1000);
+  setInterval(() => pollShips(), 60 * 1000);
+  setInterval(() => pollTrains(), 15 * 1000);
+  setInterval(() => pollNYC(), 5 * 60 * 1000);
+  setInterval(() => { if (nycAsOf) nycStatus(); }, 60 * 1000);
 })();
 </script>
 </body>
