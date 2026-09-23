@@ -406,6 +406,7 @@ scene.add(hemi);
 
 const U = {
   time: { value: 0 },
+  frameN: { value: 0 },
   sunDir: { value: sunDir },
   cloudMap: { value: null },
   flowMap: { value: null },
@@ -420,6 +421,7 @@ const U = {
 const GLSL_COMMON = /* glsl */`
 #define PI 3.141592653589793
 uniform float time;
+uniform float frameN;
 uniform vec3 sunDir;
 uniform sampler2D cloudMap;   // r = cloud cover, g = top height /16 km, b = base height /16 km, a = source (1 satellite, 0 model)
 uniform sampler2D flowMap;    // live 10 m wind (u, v) ±25 m/s
@@ -560,12 +562,20 @@ vec2 cloudUv(vec3 d){
   uv.y -= fl.y * cloudAge / (PI*6371000.0);
   return uv;
 }
+// the cloud map is ~20 km per pixel: warp its lookup with ~160 km noise and perturb partial cover so
+// field edges break up like real cloud fields instead of showing the grid (solid and clear areas stay as observed)
+vec4 cloudCol(vec3 p){
+  vec3 w = textureLod(noise3, p / 160.0 + vec3(0.13, 0.71, 0.37), 1.5).rgb - 0.5;
+  vec4 c = texture2D(cloudMap, cloudUv(normalize(p + w * 44.0)));
+  float m = textureLod(noise3, p / 55.0 + vec3(0.5, 0.21, 0.83), 1.0).r - 0.5;
+  c.r = clamp(c.r + m * 2.2 * c.r * (1.0 - c.r), 0.0, 1.0);
+  return c;
+}
 float cloudDensL(vec3 p, bool detail, float lod){
   float r = length(p);
   float hk = r - RE;
   if(hk < C_BOT || hk > C_TOP) return 0.0;
-  vec3 d = p / r;
-  vec4 c = texture2D(cloudMap, cloudUv(d));
+  vec4 c = cloudCol(p);
   float cov = c.r;
   if(cov < 0.03) return 0.0;
   float top = c.g * 16.0, base = c.b * 16.0;
@@ -685,7 +695,21 @@ vec3 shadeSurface(vec3 alb, vec3 P, vec3 bn, float water, float lum, vec2 uvG, f
   vec3 lights = vec3(1.0, 0.78, 0.48) * max(nl - 0.16, 0.0) * 2.6 * (1.0 - water);
   lights *= 0.6 + 1.2 * smoothstep(0.15, 0.4, lum);
   float nightF = 1.0 - smoothstep(-0.14, 0.02, ndl);
-  col += lights * nightF * showLights * (1.0 - 0.6 * sh);
+  // the lights texture is ~2 km per pixel: from orbit it's the city glow, but at street level it would paint whole
+  // districts orange, so there it gives way to scattered point lights (streets draw their own lamp pools)
+  float farL = smoothstep(0.0006, 0.004, camDist);
+  vec3 cellP = floor(P * RE * 1000.0 / 14.0);
+  vec3 hp = fract(cellP * vec3(0.1031, 0.1030, 0.0973)); hp += dot(hp, hp.yxz + 33.33);
+  float hh = fract((hp.x + hp.y) * hp.z);
+  float urban = smoothstep(0.12, 0.45, nl);
+  // each lamp is a ~2 m source with a soft pool; once lamps are sub-pixel, use their average brightness
+  float fpM = camDist * RE * 1000.0 * pixAng;
+  float dM = length(fract(P * RE * 1000.0 / 14.0) - 0.5) * 14.0;
+  float lamp = exp(-dM * dM / 1.2) * 3.5 + exp(-dM * dM / 12.0) * 0.4;
+  lamp = mix(lamp, 0.2, smoothstep(3.0, 12.0, fpM));
+  vec3 points = vec3(1.0, 0.8, 0.52) * step(0.965 - 0.05 * urban, hh) * urban * lamp;
+  col += (lights * farL + points * (1.0 - farL)) * nightF * showLights * (1.0 - 0.6 * sh);
+  col += alb * vec3(1.0, 0.8, 0.6) * 0.05 * urban * (1.0 - farL) * nightF * showLights;   // sodium sky-glow on the ground
   col += alb * 0.012 * (1.0 - smoothstep(-0.1, 0.1, ndl));
   vec4 rad = texture2D(radarMap, uvG);
   col = mix(col, rad.rgb * (0.45 + 0.55 * smoothstep(-0.1, 0.2, ndl)), clamp(rad.a * 1.3, 0.0, 1.0) * showRadar * 0.8);
@@ -1127,7 +1151,7 @@ const cloudMat = new THREE.ShaderMaterial({
       // looking down on the layer: march only between this column's real cloud base and top
       if(rc > RE + C_TOP){
         vec3 pe = ro + rd * t0;
-        vec4 cc = texture2D(cloudMap, cloudUv(normalize(pe)));
+        vec4 cc = cloudCol(normalize(pe) * (RE + 5.0));
         if(cc.r < 0.02 && t1 - t0 < 60.0) discard;
         float topK = cc.g * 16.0 + 0.4, botK = max(cc.b * 16.0 - 0.4, C_BOT);
         vec2 st = rsi(ro, rd, RE + topK), sb = rsi(ro, rd, RE + botK);
@@ -1139,7 +1163,8 @@ const cloudMat = new THREE.ShaderMaterial({
       }
       float nSteps = rc < RE + C_TOP ? min(steps * 1.5, 96.0) : steps;
       float ds = (t1 - t0) / nSteps;
-      float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));   // interleaved gradient noise
+      // interleaved gradient noise, rotated by the golden ratio every frame so the eye averages it instead of seeing a hatch
+      float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))) + frameN * 0.618034);
       float mu = dot(rd, sunDir);
       float phase = mix(hg(mu, 0.75), hg(mu, -0.25), 0.5) * 4.0*PI + 0.55;   // + isotropic multiple scattering
       float T = 1.0; vec3 L = vec3(0.0);
@@ -1148,7 +1173,7 @@ const cloudMat = new THREE.ShaderMaterial({
         if(float(i) >= nSteps) break;
         float tt = t0 + (float(i) + jitter) * ds;
         vec3 p = ro + rd * tt;
-        float lod = noiseLod(tt * pixAng);
+        float lod = noiseLod(max(tt * pixAng, ds));   // band-limit to the pixel AND the step, or long grazing rays alias into streaks
         float dn = cloudDensL(p, true, lod) * smoothstep(0.4, 2.5, tt);   // thin out cloud right at the eye
         if(dn > 0.001){
           if(tHit < 0.0) tHit = tt;
@@ -1858,10 +1883,12 @@ const buildMat = new THREE.ShaderMaterial({
         float fw = 3.3, fh = 3.2;
         float fx = fract(vF.x / fw), fy = fract(vF.y / fh);
         float aa = fwidth(vF.x / fw) + fwidth(vF.y / fh);
-        win = smoothstep(0.16, 0.16 + aa, fx) * smoothstep(0.84, 0.84 - aa, fx) * smoothstep(0.26, 0.26 + aa, fy) * smoothstep(0.84, 0.84 - aa, fy);
-        win *= step(2.8, vF.y) * (1.0 - smoothstep(0.35, 0.8, aa * 2.0));
+        float w0 = smoothstep(0.16, 0.16 + aa, fx) * smoothstep(0.84, 0.84 - aa, fx) * smoothstep(0.26, 0.26 + aa, fy) * smoothstep(0.84, 0.84 - aa, fy);
+        float above = step(2.8, vF.y), wv = 1.0 - smoothstep(0.35, 0.8, aa * 2.0);   // wv: windows still resolvable
+        win = w0 * above * wv;
         vec2 cell = vec2(floor(vF.x / fw), floor(vF.y / fh));
-        lit = win * step(0.5, h12(cell + vF.w * 13.1));
+        // once windows are sub-pixel, the facade glows with the average of its lit windows instead of going black
+        lit = mix(0.12 * above * (0.6 + 0.8 * fract(vF.w * 7.31)), w0 * above * step(0.5, h12(cell + vF.w * 13.1)), wv);
         base = mix(base, vec3(0.13, 0.16, 0.2), win * 0.75);
       }
       vec3 col = base * (Ts * 1.2 * diff * (1.0 - 0.8 * sh) + amb + Ts * max(ndl, 0.0) * sh * 0.42 * (0.7 + 0.3 * up));
@@ -1872,6 +1899,7 @@ const buildMat = new THREE.ShaderMaterial({
       col += win * Ts * pow(max(dot(Rf, sunDir), 0.0), 200.0) * 2.0 * (1.0 - sh);
       float nightF = 1.0 - smoothstep(-0.12, 0.04, ndl);
       col += lit * nightF * vec3(1.0, 0.78, 0.46) * 0.95;
+      col += base * nightF * vec3(1.0, 0.8, 0.6) * 0.035;                   // city light pollution on walls and roofs
       vec3 L, T;
       atmo(cameraPosition * RE, -V, length(cameraPosition - vW) * RE, L, T);
       gl_FragColor = vec4(shoulder(col * T + skyTone(L * HAZE)), 1.0);
@@ -1879,9 +1907,21 @@ const buildMat = new THREE.ShaderMaterial({
   extensions: { derivatives: true }
 });
 const _col = new THREE.Color();
+// OSM colour tags are free text: CSS names, bare hex, or local-language words
+const COLOR_WORDS = { blanc: 'white', blanche: 'white', weiss: 'white', 'weiß': 'white', gris: 'grey', grau: 'grey', rouge: 'red', rot: 'red',
+  jaune: 'yellow', gelb: 'yellow', brun: 'brown', braun: 'brown', noir: 'black', schwarz: 'black', ocre: '#c8a165', creme: '#f3ead3', 'crème': '#f3ead3' };
+const tagColorCache = new Map();
 function tagColor(v) {
   if (!v) return null;
-  try { _col.setStyle(String(v).trim().replace(/^([0-9a-f]{6})$/i, '#$1')); return [_col.r, _col.g, _col.b]; } catch (e) { return null; }
+  const key = String(v).trim().toLowerCase();
+  if (tagColorCache.has(key)) return tagColorCache.get(key);
+  let css = COLOR_WORDS[key] || key.replace(/^([0-9a-f]{6}|[0-9a-f]{3})$/, '#$1');
+  let out = null;
+  if (typeof CSS === 'undefined' || !CSS.supports || CSS.supports('color', css)) {
+    try { _col.setStyle(css); out = [_col.r, _col.g, _col.b]; } catch (e) { out = null; }
+  }
+  tagColorCache.set(key, out);
+  return out;
 }
 const ringArea = pts => { let a = 0; for (let i = 0; i < pts.length; i++) { const p = pts[i], q = pts[(i + 1) % pts.length]; a += p[0] * q[1] - q[0] * p[1]; } return a / 2; };
 function buildTileMesh(e) {
@@ -2071,30 +2111,70 @@ function vtGet(z, x, y) {
     setTimeout(() => rej(new Error('vt timeout')), 30000);
   });
 }
-const LC_COL = { grass: '#8fae6a', wood: '#5f8a4c', forest: '#5f8a4c', farmland: '#b9bf85', wetland: '#7fa38a', sand: '#dccfa6', ice: '#eef3f6', rock: '#a9a39a', scrub: '#8aa066' };
-const LU_COL = { residential: '#c9c3b6', commercial: '#c6bdb4', industrial: '#b8b4ad', retail: '#c9bdb0', cemetery: '#9fb58c', stadium: '#a9bd8f', pitch: '#8fbf6f', school: '#cdc3b0', university: '#cdc3b0', hospital: '#d0c2bf', railway: '#b4ada6' };
+// muted, satellite-like tones (not map-style pastels): this stands in for a photo until the photo arrives
+const LC_COL = { grass: '#7b8b55', wood: '#3e5a33', forest: '#3e5a33', farmland: '#9a9563', wetland: '#5e7560', sand: '#cdbf98', ice: '#e8eef2', rock: '#8f8a80', scrub: '#6f7d4d' };
+const LU_COL = { residential: '#9d978c', commercial: '#9a938b', industrial: '#8f8b85', retail: '#9d948a', cemetery: '#6f8157', stadium: '#7d8f63', pitch: '#6d8f4f', school: '#a39b8c', university: '#a39b8c', hospital: '#a69a95', railway: '#86807a' };
+// the nearest ancestor tile that has real imagery, cropped and upscaled to this tile (null if none is loaded)
+function ancestorImagery(t) {
+  for (let z = t.z - 1; z >= MIN_Z; z--) {
+    const d = t.z - z, a = tiles.get(z + '/' + (t.x >> d) + '/' + (t.y >> d));
+    if (!a || !a.mesh || a.vectorFallback) continue;
+    const img = a.mesh.material.uniforms.map.value.image, S = img.width, src = img.data;
+    const tmp = document.createElement('canvas'); tmp.width = tmp.height = S;
+    const tc = tmp.getContext('2d'), id = tc.createImageData(S, S);
+    for (let r = 0; r < S; r++) {                   // DataTexture rows run south→north; alpha holds the water mask
+      const so = (S - 1 - r) * S * 4, dO = r * S * 4;
+      for (let c = 0; c < S * 4; c += 4) { id.data[dO + c] = src[so + c]; id.data[dO + c + 1] = src[so + c + 1]; id.data[dO + c + 2] = src[so + c + 2]; id.data[dO + c + 3] = 255; }
+    }
+    tc.putImageData(id, 0, 0);
+    const sub = S / 2 ** d;
+    return { canvas: tmp, sx: (t.x - ((t.x >> d) << d)) * sub, sy: (t.y - ((t.y >> d) << d)) * sub, sub };
+  }
+  return null;
+}
 async function rasterizeVector(t) {
   const zv = Math.min(t.z, BZ), sh = t.z - zv, xv = t.x >> sh, yv = t.y >> sh;
   const e = await vtGet(zv, xv, yv);
   const S = 256, cv = document.createElement('canvas'); cv.width = cv.height = S;
-  const cx = cv.getContext('2d');
+  const cx = cv.getContext('2d', { willReadFrequently: true });
   const s = 2 ** sh, anyL = e.data.water || e.data.building || e.data.transportation, ext = anyL ? anyL.extent : 4096;
   const ox = (t.x - xv * s) * ext / s, oy = (t.y - yv * s) * ext / s, k = S * s / ext;
   const path = rings => { cx.beginPath(); for (const r of rings) { r.forEach(([px, py], i) => { const X = (px - ox) * k, Y = (py - oy) * k; i ? cx.lineTo(X, Y) : cx.moveTo(X, Y); }); cx.closePath(); } };
-  cx.fillStyle = '#b9b79a'; cx.fillRect(0, 0, S, S);
-  for (const f of e.data.landcover?.features || []) { cx.fillStyle = LC_COL[f.props.class] || LC_COL[f.props.subclass] || '#a3b27c'; path(f.rings); cx.fill('evenodd'); }
-  for (const f of e.data.landuse?.features || []) { const c = LU_COL[f.props.class]; if (!c) continue; cx.fillStyle = c; path(f.rings); cx.fill('evenodd'); }
-  for (const f of e.data.park?.features || []) { cx.fillStyle = '#86a868'; path(f.rings); cx.fill('evenodd'); }
-  for (const f of e.data.water?.features || []) { cx.fillStyle = '#2f4f66'; path(f.rings); cx.fill('evenodd'); }
+  const anc = ancestorImagery(t);
+  if (anc) {
+    // real (blurry) photo underneath; vector data only sharpens water edges, streets and roofs
+    cx.imageSmoothingEnabled = true; cx.imageSmoothingQuality = 'high';
+    cx.drawImage(anc.canvas, anc.sx, anc.sy, anc.sub, anc.sub, 0, 0, S, S);
+    cx.globalAlpha = 0.35;
+    for (const f of e.data.park?.features || []) { cx.fillStyle = '#4f6f3c'; path(f.rings); cx.fill('evenodd'); }
+    cx.globalAlpha = 1;
+  } else {
+    cx.fillStyle = '#8f8c6c'; cx.fillRect(0, 0, S, S);
+    for (const f of e.data.landcover?.features || []) { cx.fillStyle = LC_COL[f.props.class] || LC_COL[f.props.subclass] || '#7d8a5a'; path(f.rings); cx.fill('evenodd'); }
+    for (const f of e.data.landuse?.features || []) { const c = LU_COL[f.props.class]; if (!c) continue; cx.fillStyle = c; path(f.rings); cx.fill('evenodd'); }
+    for (const f of e.data.park?.features || []) { cx.fillStyle = '#62804a'; path(f.rings); cx.fill('evenodd'); }
+  }
+  for (const f of e.data.water?.features || []) { cx.fillStyle = '#23394a'; path(f.rings); cx.fill('evenodd'); }
   cx.lineCap = cx.lineJoin = 'round';
   const mpp = 40075016 * Math.cos(tileBBox(t.x, t.y, t.z).n * DEG) / (2 ** t.z * S);    // metres per pixel
   const feats = (e.data.transportation?.features || []).filter(f => f.type === 2 && ROAD[f.props.class] && f.props.brunnel !== 'tunnel').sort((a, b) => ROAD[a.props.class][0] - ROAD[b.props.class][0]);
+  cx.globalAlpha = anc ? 0.8 : 1;
   for (const f of feats) {
     const [w, col] = ROAD[f.props.class];
     cx.strokeStyle = `rgb(${col.map(c => Math.round(c * 255)).join(',')})`; cx.lineWidth = Math.max(w / mpp, 0.6);
     cx.beginPath(); for (const r of f.rings) r.forEach(([px, py], i) => { const X = (px - ox) * k, Y = (py - oy) * k; i ? cx.lineTo(X, Y) : cx.moveTo(X, Y); }); cx.stroke();
   }
-  for (const f of e.data.building?.features || []) { cx.fillStyle = '#a8a39b'; path(f.rings); cx.fill('evenodd'); }
+  cx.globalAlpha = anc ? 0.55 : 1;
+  for (const f of e.data.building?.features || []) { cx.fillStyle = '#8a8580'; path(f.rings); cx.fill('evenodd'); }
+  cx.globalAlpha = 1;
+  // fine grain so flat fills don't read as a cartoon map
+  const im = cx.getImageData(0, 0, S, S), px = im.data;
+  for (let q = 0, h = (t.x * 73856093 ^ t.y * 19349663 ^ t.z * 83492791) >>> 0; q < px.length; q += 4) {
+    h = (h * 1664525 + 1013904223) >>> 0;
+    const n = ((h >>> 24) - 128) * (anc ? 0.05 : 0.1);
+    px[q] = px[q] + n; px[q + 1] = px[q + 1] + n; px[q + 2] = px[q + 2] + n;
+  }
+  cx.putImageData(im, 0, 0);
   return cv;
 }
 
@@ -2244,9 +2324,19 @@ function updateLabels(now, alt) {
 }
 /* ---------- Wikipedia: find the article for a place by location + name ---------- */
 const normName = s => String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(w => w.length > 2 && !['the', 'and', 'des', 'les', 'del', 'von', 'der'].includes(w));
+const wikiCache = new Map();
 async function wikiNear(names, lat, lon, radius = 400) {
-  const gs = await fetchJSON(`https://en.wikipedia.org/w/api.php?action=query&list=geosearch&gscoord=${lat.toFixed(5)}|${lon.toFixed(5)}&gsradius=${radius}&gslimit=20&format=json&origin=*`, 12000);
-  const list = gs?.query?.geosearch || [];
+  const ck = names.join('|') + '|' + lat.toFixed(4) + '|' + lon.toFixed(4) + '|' + radius;
+  if (wikiCache.has(ck)) return wikiCache.get(ck);
+  const res = await wikiLookup(names, lat, lon, radius);
+  wikiCache.set(ck, res);
+  return res;
+}
+async function wikiLookup(names, lat, lon, radius) {
+  const gs = await fetchJSON(`https://en.wikipedia.org/w/api.php?action=query&generator=geosearch&ggscoord=${lat.toFixed(5)}|${lon.toFixed(5)}&ggsradius=${radius}&ggslimit=20` +
+    `&prop=coordinates|extracts|pageimages|description|info&inprop=url&exintro=1&explaintext=1&exsentences=3&exlimit=20&piprop=thumbnail&pithumbsize=480&pilimit=20` +
+    `&codistancefrompoint=${lat.toFixed(5)}|${lon.toFixed(5)}&format=json&formatversion=2&origin=*`, 20000);
+  const list = (gs?.query?.pages || []).map(pg => ({ ...pg, dist: pg.coordinates?.[0]?.dist ?? 1e9 })).sort((a, b) => a.dist - b.dist);
   const want = new Set(names.flatMap(normName));
   let best = null, bs = 0;
   for (const g of list) {
@@ -2256,7 +2346,10 @@ async function wikiNear(names, lat, lon, radius = 400) {
   }
   if (!best && !want.size && list[0] && list[0].dist < 80) best = list[0];
   if (!best || (want.size && bs < 0.3)) return null;
-  return fetchJSON(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(best.title.replace(/ /g, '_'))}`, 12000);
+  // same shape wikiBlock() reads
+  return { title: best.title, description: best.description, extract: best.extract,
+    thumbnail: best.thumbnail ? { source: best.thumbnail.source } : null,
+    content_urls: { desktop: { page: best.fullurl || `https://en.wikipedia.org/wiki/${encodeURIComponent(best.title.replace(/ /g, '_'))}` } } };
 }
 
 /* =====================================================================
@@ -2964,31 +3057,47 @@ async function probeWeather(lat, lon, label) {
     fetchJSON(`https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat.toFixed(4)}&longitude=${lon.toFixed(4)}&localityLanguage=en`)
   ]);
   if (cardKind !== 'wx' || !pinLL || pinLL.lat !== lat) return;
-  let place = '';
+  let place = '', tz = null;
   if (g.status === 'fulfilled') {
     const d = g.value;
+    tz = d.localityInfo?.informative?.find(i => /time zone/i.test(i.description || ''))?.name || null;
     place = [d.city || d.locality, d.principalSubdivision, d.countryName].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i).slice(0, 2).join(', ');
     if (!place && d.localityInfo && d.localityInfo.informative && d.localityInfo.informative[0]) place = d.localityInfo.informative[0].name;
   }
   place = place || `${fmtLat(lat)} ${fmtLon(lon)}`;
   const elev = elevAt(lat, lon);
   const cl = cloudAt(lat, lon);
-  if (w.status !== 'fulfilled') {
+  let c, off, est = false;
+  if (w.status === 'fulfilled' && w.value.current) { c = w.value.current; off = w.value.utc_offset_seconds || 0; }
+  else if (grid.ok) {
+    // point forecast unavailable (offline or rate-limited): use the live global grid already on screen
+    est = true;
+    const nearest = arr => { const gx = Math.round((wrapLon(lon) + 172.5) / 15), gy = clamp(Math.round((lat + 82.5) / 15), 0, GH - 1); return arr[gy * GW + ((gx % GW) + GW) % GW]; };
+    const u = gridSample(grid.u, lat, lon), v = gridSample(grid.v, lat, lon), ws = Math.hypot(u, v);
+    c = { temperature_2m: gridSample(grid.temp, lat, lon), apparent_temperature: null, weather_code: nearest(grid.code),
+      wind_speed_10m: ws * 3.6, wind_direction_10m: (Math.atan2(-u, -v) / DEG + 360) % 360, wind_gusts_10m: null,
+      relative_humidity_2m: Math.round(gridSample(grid.rh, lat, lon)), pressure_msl: null, visibility: null,
+      precipitation: +gridSample(grid.precip, lat, lon).toFixed(1),
+      cloud_cover_low: gridSample(grid.cl, lat, lon), cloud_cover_mid: gridSample(grid.cm, lat, lon), cloud_cover_high: gridSample(grid.ch, lat, lon) };
+    off = Math.round(lon / 15) * 3600;
+  } else {
     openCard('wx', `<div class="k">${esc(label || 'Weather')}</div><div class="h">${esc(place)}</div><div class="meta">Weather unavailable</div>`);
     return;
   }
-  const c = w.value.current, off = w.value.utc_offset_seconds || 0;
-  const local = new Date(Date.now() + off * 1000);
+  let localStr = '';
+  try { if (tz) localStr = new Date().toLocaleTimeString('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit' }) + ' local'; } catch (e) { localStr = ''; }
+  const local = new Date(Date.now() + off * 1000), n0 = (x, d = 0) => x == null ? '–' : (+x).toFixed(d);
   const tops = cl.cov > 0.08 ? `Cloud tops ≈ ${cl.top.toFixed(1)} km${cl.sat ? ' (satellite IR)' : ' (model)'} · base ≈ ${cl.base.toFixed(1)} km` : 'No cloud detected overhead';
   openCard('wx', `
     <div class="k">${esc(label || 'Weather')}${elev !== null ? ' · ' + Math.round(elev) + ' m elevation' : ''}</div>
     <div class="h">${esc(place)}</div>
-    <div class="big">${Math.round(c.temperature_2m)}°<small>${wmo(c.weather_code)} · feels ${Math.round(c.apparent_temperature)}°</small></div>
-    <div class="stats"><span><b>${Math.round(c.wind_speed_10m)}</b> km/h ${compass(c.wind_direction_10m)} (gusts ${Math.round(c.wind_gusts_10m)})</span><span><b>${c.relative_humidity_2m}</b>% humidity</span>
-      <span><b>${Math.round(c.pressure_msl)}</b> hPa</span><span><b>${c.visibility != null ? (c.visibility / 1000).toFixed(0) : '–'}</b> km visibility</span><span><b>${c.precipitation}</b> mm precip</span></div>
+    <div class="big">${Math.round(c.temperature_2m)}°<small>${wmo(c.weather_code)}${c.apparent_temperature != null ? ' · feels ' + Math.round(c.apparent_temperature) + '°' : ''}</small></div>
+    <div class="stats"><span><b>${n0(c.wind_speed_10m)}</b> km/h ${compass(c.wind_direction_10m)}${c.wind_gusts_10m != null ? ' (gusts ' + Math.round(c.wind_gusts_10m) + ')' : ''}</span><span><b>${n0(c.relative_humidity_2m)}</b>% humidity</span>
+      <span><b>${n0(c.pressure_msl)}</b> hPa</span><span><b>${c.visibility != null ? (c.visibility / 1000).toFixed(0) : '–'}</b> km visibility</span><span><b>${n0(c.precipitation, 1)}</b> mm precip</span></div>
     <div class="layers">${layerBar('High cloud', c.cloud_cover_high, ' · 6–13 km')}${layerBar('Mid cloud', c.cloud_cover_mid, ' · 2–6 km')}${layerBar('Low cloud', c.cloud_cover_low, ' · 0–2 km')}</div>
     <div class="meta"><span>${tops}</span></div>
-    <div class="meta"><span>${pad(local.getUTCHours())}:${pad(local.getUTCMinutes())} local · ${fmtLat(lat)} ${fmtLon(lon)}</span><button onclick="window.__zoomPin()">Zoom in</button></div>`);
+    ${est ? '<div class="meta"><span>Regional estimate from the live 15° weather grid — point forecast unavailable</span></div>' : ''}
+    <div class="meta"><span>${localStr || pad(local.getUTCHours()) + ':' + pad(local.getUTCMinutes()) + (est ? ' solar time' : ' local')} · ${fmtLat(lat)} ${fmtLon(lon)}</span><button onclick="window.__zoomPin()">Zoom in</button></div>`);
 }
 window.__hideCard = () => { hideCard(); if (mode !== 'orbit') setMode('orbit'); };
 window.__zoomPin = () => { if (pinLL) flyTo(pinLL.lat, pinLL.lon, 0.0004, 2.4); };
@@ -3047,7 +3156,10 @@ async function showLandmarkCard(lm) {
   const links = wl => `<div class="meta"><button onclick="window.__flyTo(${lm.lat},${lm.lon},0.00012)">Fly here</button>${wl}${mapLink(lm.lat, lm.lon)}</div>`;
   openCard('lm', base + '<div class="meta">Looking up the article…</div>', lm);
   let wiki = null;
-  try { wiki = await wikiNear([lm.name, lm.local], lm.lat, lm.lon, 600); } catch (e) { wiki = null; }
+  for (let attempt = 0; attempt < 2 && !wiki; attempt++) {
+    try { wiki = await wikiNear([lm.name, lm.local], lm.lat, lm.lon, 600); break; } catch (e) { wiki = null; }
+    if (cardObj !== lm) return;
+  }
   if (cardObj !== lm) return;
   const w = wikiBlock(wiki);
   openCard('lm', base + w.html + links(w.link) + `<div class="meta"><span>${fmtLat(lm.lat)} ${fmtLon(lm.lon)}</span></div>`, lm);
@@ -3245,7 +3357,7 @@ function adaptQuality(ms, now) {
 function frame() {
   const raw = clock.getDelta(), dt = Math.min(raw, 0.1), now = performance.now();
   adaptQuality(raw * 1000, now);
-  U.time.value += dt;
+  U.time.value += dt; U.frameN.value = (U.frameN.value + 1) % 4096;
   updateSky();
   const alt = updateCamera(dt);
   updateTiles();
@@ -3270,7 +3382,7 @@ function frame() {
 /* =====================================================================
    BOOT
    ===================================================================== */
-if (/[?&]debug\b/.test(location.search)) window.__mw = { flyTo, cam, camera, tiles, get alt() { return camera.position.length() - 1; } };
+if (/[?&]debug\b/.test(location.search)) window.__mw = { flyTo, cam, camera, tiles, wikiNear, get alt() { return camera.position.length() - 1; } };
 (async function boot() {
   const [day, night, topo, water] = await Promise.all([
     loadTex('earth-blue-marble.jpg', solidTex(18, 52, 96)), loadTex('earth-night.jpg', solidTex(0, 0, 0)),
