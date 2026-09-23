@@ -406,6 +406,14 @@ vec3 tempRamp(float c){
   col = mix(col, vec3(0.9,0.15,0.2), smoothstep(30.0,40.0,c));
   return col;
 }
+// soft highlight shoulder: bright values roll off instead of clipping to flat white
+vec3 shoulder(vec3 c){ vec3 t = max(c - 0.78, 0.0); return min(c, 0.78) + 0.22 * (1.0 - exp(-t * 4.5)); }
+// sun glint: from far away, unresolved waves spread the reflection into a wide soft sheen;
+// up close it tightens into a sharp sparkle (normalised so total energy stays similar)
+float sunGlint(vec3 R, float camDist){
+  float e = mix(420.0, 14.0, smoothstep(0.004, 1.6, camDist));
+  return pow(max(dot(R, sunDir), 0.0), e) * (e + 8.0) / 70.0;
+}
 // aerial perspective: haze grows with the path length travelled through a thin atmosphere shell
 vec3 aerial(vec3 col, vec3 P, vec3 n){
   const float H = 0.0095;
@@ -556,8 +564,8 @@ const earthMat = new THREE.ShaderMaterial({
       float diff = max(dot(bn, sunDir), 0.0);
       float sh = groundShadow(n) * cloudShadow;
       vec3 col = day * (0.05 + 1.08*diff*(1.0 - 0.45*sh));
-      float spec = pow(max(dot(reflect(-sunDir, wn), V), 0.0), 48.0) * water;
-      col += spec * vec3(1.0,0.93,0.8) * 0.65 * dayF * (1.0 - sh);
+      float spec = sunGlint(reflect(-V, wn), length(cameraPosition - vPos)) * smoothstep(0.5, 0.9, water);
+      col += spec * vec3(1.0,0.95,0.86) * dayF * (1.0 - sh);
       float twi = smoothstep(0.22, 0.0, abs(ndl));
       col += vec3(0.35,0.12,0.02) * twi * 0.22 * dayF;
       // city lights on the night side (dimmed under cloud)
@@ -572,7 +580,7 @@ const earthMat = new THREE.ShaderMaterial({
       vec4 wx = texture2D(wxMap, vUv);
       col = mix(col, tempRamp(wx.b*100.0-50.0) * (0.45 + 0.6*max(ndl,0.0)), showTemp * 0.62);
       col = aerial(col, vPos, n);
-      gl_FragColor = vec4(col, 1.0);
+      gl_FragColor = vec4(shoulder(col), 1.0);
     }`
 });
 // the textured globe is only a fallback (poles, tiles still loading); real terrain comes from the tiles
@@ -665,7 +673,7 @@ const TILE_VS = /* glsl */`
     gl_Position = projectionMatrix*viewMatrix*vec4(position,1.0);
   }`;
 const TILE_FS = GLSL_COMMON + /* glsl */`
-  uniform sampler2D map, nightMap, waterMap, radarMap;
+  uniform sampler2D map, nightMap, waterMap, radarMap, waterMask;
   uniform float hasDem;
   uniform float showRadar, showTemp, showLights, cloudShadow;
   varying vec2 vUv; varying vec2 vUvG; varying vec3 vPos; varying vec3 vN; varying float vH;
@@ -680,7 +688,8 @@ const TILE_FS = GLSL_COMMON + /* glsl */`
     day = mix(vec3(lum), day, 1.15);
     day = pow(day, vec3(1.06));
     float wm = texture2D(waterMap, vUvG).r;
-    float water = hasDem > 0.5 ? smoothstep(1.0, -4.0, vH) * smoothstep(0.02, 0.25, wm) : smoothstep(0.4, 0.6, wm);
+    // crisp coastline from the tile's own elevation mask; the coarse global map only vetoes inland depressions
+    float water = hasDem > 0.5 ? smoothstep(0.3, 0.7, texture2D(waterMask, vUv).r) * smoothstep(0.05, 0.3, wm) : smoothstep(0.45, 0.65, wm);
     float ndl = dot(n, sunDir);
     float dayF = smoothstep(-0.10, 0.12, ndl);
     // terrain relief on top of the imagery (it already holds baked shading, so blend gently)
@@ -703,8 +712,8 @@ const TILE_FS = GLSL_COMMON + /* glsl */`
       float fres = 0.02 + 0.98 * pow(1.0 - max(dot(wn, V), 0.0), 5.0);
       vec3 skyC = mix(vec3(0.02,0.03,0.06), vec3(0.45,0.62,0.9), dayF);
       vec3 R = reflect(-V, wn);
-      float glint = pow(max(dot(R, sunDir), 0.0), 380.0) * 6.0 + pow(max(dot(R, sunDir), 0.0), 24.0) * 0.18;
-      vec3 wcol = mix(col, skyC, fres * 0.55 * dayF + fres * 0.2) + vec3(1.0,0.92,0.78) * glint * dayF * (1.0 - sh);
+      float glint = sunGlint(R, camDist);
+      vec3 wcol = mix(col, skyC, fres * 0.45 * dayF + fres * 0.15) + vec3(1.0,0.95,0.86) * glint * dayF * (1.0 - sh);
       col = mix(col, wcol, water);
     }
     col += vec3(0.35,0.12,0.02) * smoothstep(0.22, 0.0, abs(ndl)) * 0.18 * dayF;
@@ -719,7 +728,7 @@ const TILE_FS = GLSL_COMMON + /* glsl */`
     vec4 wx = texture2D(wxMap, vUvG);
     col = mix(col, tempRamp(wx.b*100.0-50.0) * (0.45 + 0.6*max(ndl,0.0)), showTemp * 0.62);
     col = aerial(col, vPos, n);
-    gl_FragColor = vec4(col, 1.0);
+    gl_FragColor = vec4(shoulder(col), 1.0);
   }`;
 
 const tiles = new Map();
@@ -831,6 +840,19 @@ function buildTileGeo(t, dem, zE, ex, ey) {
   t.minH = minH; t.maxH = maxH;
   return g;
 }
+function buildWaterMask(t, dem, zE, ex, ey) {
+  const M = 128, data = new Uint8Array(M * M);
+  for (let r = 0; r < M; r++) {
+    const lat = mercLat(lerp(t.y1, t.y0, (r + 0.5) / M));   // row 0 = bottom of the tile (texture v = 0)
+    for (let c = 0; c < M; c++) {
+      const h = demSample(dem, zE, ex, ey, lat, lerp(t.lonW, t.lonE, (c + 0.5) / M));
+      data[r * M + c] = h < 0.5 ? 255 : 0;
+    }
+  }
+  const tex = new THREE.DataTexture(data, M, M, THREE.RedFormat, THREE.UnsignedByteType);
+  tex.magFilter = tex.minFilter = THREE.LinearFilter; tex.needsUpdate = true;
+  return tex;
+}
 async function loadTile(t) {
   tileLoads++; t.state = 'loading';
   const zE = Math.min(t.z, DEM_MAX_Z), sh = t.z - zE, ex = t.x >> sh, ey = t.y >> sh;
@@ -842,8 +864,9 @@ async function loadTile(t) {
     tex.colorSpace = THREE.NoColorSpace;
     tex.needsUpdate = true;
     const geo = buildTileGeo(t, dem.data ? dem : null, zE, ex, ey);
+    const mask = dem.data ? buildWaterMask(t, dem, zE, ex, ey) : blankTex;
     const mat = new THREE.ShaderMaterial({
-      uniforms: { ...tileU, map: { value: tex }, hasDem: { value: dem.data ? 1 : 0 } }, vertexShader: TILE_VS, fragmentShader: TILE_FS
+      uniforms: { ...tileU, map: { value: tex }, waterMask: { value: mask }, hasDem: { value: dem.data ? 1 : 0 } }, vertexShader: TILE_VS, fragmentShader: TILE_FS
     });
     t.mesh = new THREE.Mesh(geo, mat);
     t.mesh.frustumCulled = false; t.mesh.visible = false;
@@ -853,7 +876,7 @@ async function loadTile(t) {
   tileLoads--;
 }
 function freeTile(t) {
-  if (t.mesh) { tileGroup.remove(t.mesh); t.mesh.geometry.dispose(); t.mesh.material.uniforms.map.value.dispose(); t.mesh.material.dispose(); t.mesh = null; }
+  if (t.mesh) { tileGroup.remove(t.mesh); t.mesh.geometry.dispose(); t.mesh.material.uniforms.map.value.dispose(); if (t.mesh.material.uniforms.waterMask.value !== blankTex) t.mesh.material.uniforms.waterMask.value.dispose(); t.mesh.material.dispose(); t.mesh = null; }
   tiles.delete(t.k);
 }
 function visitTile(t, out) {
@@ -1728,7 +1751,7 @@ function updateISS() {
   const f2 = new THREE.Vector3().crossVectors(right, issNow.up);
   iss.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(right, issNow.up, f2));
   const dist = iss.position.distanceTo(camera.position);
-  iss.scale.setScalar(mode === 'iss' ? 0.006 : Math.max(dist * 0.012, 0.004));
+  iss.scale.setScalar(mode === 'iss' ? 0.006 : Math.max(dist * 0.006, 0.002));
   iss.visible = layers.iss;
 }
 
