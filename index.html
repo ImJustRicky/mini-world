@@ -422,6 +422,7 @@ scene.add(hemi);
 const U = {
   time: { value: 0 },
   frameN: { value: 0 },
+  flashAmb: { value: 0 },
   sunDir: { value: sunDir },
   cloudMap: { value: null },
   flowMap: { value: null },
@@ -437,6 +438,7 @@ const GLSL_COMMON = /* glsl */`
 #define PI 3.141592653589793
 uniform float time;
 uniform float frameN;
+uniform float flashAmb;       // light from nearby lightning washing over the ground
 uniform vec3 sunDir;
 uniform sampler2D cloudMap;   // r = cloud cover, g = top height /16 km, b = base height /16 km, a = source (1 satellite, 0 model)
 uniform sampler2D flowMap;    // live 10 m wind (u, v) ±25 m/s
@@ -586,11 +588,11 @@ vec4 cloudCol(vec3 p){
   c.r = clamp(c.r + m * 2.2 * c.r * (1.0 - c.r), 0.0, 1.0);
   return c;
 }
-float cloudDensL(vec3 p, bool detail, float lod){
+// c = the column's cloud-map sample (cloudCol); light samples a few km away reuse it (the map is 20 km/pixel)
+float cloudDensC(vec3 p, vec4 c, bool detail, float lod){
   float r = length(p);
   float hk = r - RE;
   if(hk < C_BOT || hk > C_TOP) return 0.0;
-  vec4 c = cloudCol(p);
   float cov = c.r;
   if(cov < 0.03) return 0.0;
   float top = c.g * 16.0, base = c.b * 16.0;
@@ -623,6 +625,11 @@ float cloudDensL(vec3 p, bool detail, float lod){
   if(!cirrus && cellW > 0.0) dn *= mix(1.0, mix(0.45, 1.0, smoothstep(0.25, 0.75, textureLod(noise3, p / 9.0 + vec3(0.2, 0.8, 0.4), max(lod - 1.0, 0.0)).b)), cellW);
   return clamp(dn, 0.0, 1.0) * (cirrus ? 0.09 : 1.0);
 }
+float cloudDensL(vec3 p, bool detail, float lod){
+  float hk = length(p) - RE;
+  if(hk < C_BOT || hk > C_TOP) return 0.0;
+  return cloudDensC(p, cloudCol(p), detail, lod);
+}
 float cloudDens(vec3 p, bool detail){ return cloudDensL(p, detail, 0.0); }
 // fraction of direct sunlight blocked by the cloud column toward the sun (n = unit ground normal)
 float groundShadow(vec3 n){
@@ -641,6 +648,12 @@ float groundShadow(vec3 n){
 /* =====================================================================
    LOADING
    ===================================================================== */
+// aerial perspective (the 12-step atmosphere integral) per vertex instead of per pixel: haze varies smoothly
+// with distance, so interpolating it across a triangle looks the same at a fraction of the GPU cost
+const GLSL_AERIAL_VS = GLSL_COMMON + /* glsl */`
+varying vec3 vAL; varying vec3 vAT;
+void aerial(vec3 wp){ vec3 d = wp - cameraPosition; atmo(cameraPosition * RE, normalize(d), length(d) * RE, vAL, vAT); }
+`;
 const texLoader = new THREE.TextureLoader();
 function solidTex(r, g, b, a = 255) { const t = new THREE.DataTexture(new Uint8Array([r, g, b, a]), 1, 1); t.needsUpdate = true; return t; }
 // retries, then falls back to a plain texture so the app always starts (satellite tiles cover the ground anyway)
@@ -686,6 +699,7 @@ const surfU = {
 const GLSL_SURFACE = GLSL_COMMON + /* glsl */`
 uniform sampler2D nightMap, waterMap, radarMap;
 uniform float showRadar, showTemp, showLights, cloudShadow;
+varying vec3 vAL; varying vec3 vAT;
 vec3 shadeSurface(vec3 alb, vec3 P, vec3 bn, float water, float lum, vec2 uvG, float reliefW){
   alb = max(alb, 0.0);
   vec3 n = normalize(P);
@@ -745,8 +759,8 @@ vec3 shadeSurface(vec3 alb, vec3 P, vec3 bn, float water, float lum, vec2 uvG, f
   col = mix(col, rad.rgb * (0.45 + 0.55 * smoothstep(-0.1, 0.2, ndl)), clamp(rad.a * 1.3, 0.0, 1.0) * showRadar * 0.8);
   vec4 wx = texture2D(wxMap, uvG);
   col = mix(col, tempRamp(wx.b*100.0-50.0) * (0.45 + 0.6*max(ndl,0.0)), showTemp * 0.62);
-  vec3 L, T;
-  atmo(cameraPosition * RE, -V, camDist * RE, L, T);
+  col += alb * vec3(0.72, 0.78, 1.0) * flashAmb * 0.9;
+  vec3 L = vAL, T = vAT;
   return shoulder(col * T + skyTone(L * HAZE));
 }
 `;
@@ -755,9 +769,9 @@ vec3 shadeSurface(vec3 alb, vec3 P, vec3 bn, float water, float lum, vec2 uvG, f
 const earthU = { ...U, ...surfU, dayMap: { value: null }, topoMap: { value: null }, topoTexel: { value: new THREE.Vector2(1 / 2048, 1 / 1024) } };
 const earthMat = new THREE.ShaderMaterial({
   uniforms: earthU,
-  vertexShader: /* glsl */`
+  vertexShader: GLSL_AERIAL_VS + /* glsl */`
     varying vec2 vUv; varying vec3 vPos;
-    void main(){ vUv = uv; vPos = (modelMatrix*vec4(position,1.0)).xyz; gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
+    void main(){ vUv = uv; vPos = (modelMatrix*vec4(position,1.0)).xyz; aerial(vPos); gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
   fragmentShader: GLSL_SURFACE + /* glsl */`
     uniform sampler2D dayMap, topoMap;
     uniform vec2 topoTexel;
@@ -866,12 +880,12 @@ function groundM(lat, lon) { const h = elevAt(lat, lon); return h === null ? hei
 function surfaceR(lat, lon) { return 1 + groundM(lat, lon) * TERRAIN_K; }
 
 const tileU = { ...U, ...surfU };
-const TILE_VS = /* glsl */`
+const TILE_VS = GLSL_AERIAL_VS + /* glsl */`
   attribute vec2 uvG; attribute float aH;
   varying vec2 vUv; varying vec2 vUvG; varying vec3 vPos; varying vec3 vN; varying float vH;
   void main(){
     vUv = uv; vUvG = uvG; vH = aH;
-    vPos = (modelMatrix * vec4(position, 1.0)).xyz;
+    vPos = (modelMatrix * vec4(position, 1.0)).xyz; aerial(vPos);
     vN = normalize(mat3(modelMatrix) * normal);
     gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);   // camera-relative: no jitter at street level
   }`;
@@ -1156,7 +1170,8 @@ function makeNoise3D(S) {
 }
 U.noise3.value = makeNoise3D(64);
 
-const cloudU = { ...U, opacity: { value: 1 }, steps: { value: 56 }, inShell: { value: 0 }, projM: { value: null } };
+const cloudU = { ...U, opacity: { value: 1 }, steps: { value: 56 }, inShell: { value: 0 }, projM: { value: null },
+  flashes: { value: [0, 1, 2, 3].map(() => new THREE.Vector4()) }, flashOn: { value: 0 } };
 const cloudMat = new THREE.ShaderMaterial({
   uniforms: cloudU,
   vertexShader: /* glsl */`
@@ -1172,6 +1187,8 @@ const cloudMat = new THREE.ShaderMaterial({
   fragmentShader: GLSL_COMMON + /* glsl */`
     uniform float opacity, steps;
     uniform mat4 projM;
+    uniform vec4 flashes[4];      // live lightning: xyz position (km), w brightness
+    uniform float flashOn;
     varying vec3 vPos;
     float hg(float c, float g){ float g2 = g*g; return (1.0 - g2) / (4.0*PI*pow(max(1.0 + g2 - 2.0*g*c, 1e-4), 1.5)); }
     void main(){
@@ -1217,14 +1234,16 @@ const cloudMat = new THREE.ShaderMaterial({
         float tt = t0 + (float(i) + jitter) * ds;
         vec3 p = ro + rd * tt;
         float lod = noiseLod(max(tt * pixAng, ds));   // band-limit to the pixel AND the step, or long grazing rays alias into streaks
-        float dn = cloudDensL(p, true, lod) * mix(nearLo, 1.0, smoothstep(0.02, 1.2, tt));
+        float hk0 = length(p) - RE;
+        vec4 cc0 = (hk0 < C_BOT || hk0 > C_TOP) ? vec4(0.0) : cloudCol(p);
+        float dn = cloudDensC(p, cc0, true, lod) * mix(nearLo, 1.0, smoothstep(0.02, 1.2, tt));
         if(dn > 0.001){
           if(tHit < 0.0) tHit = tt;
           float od = 0.0;
-          od += cloudDensL(p + sunDir*0.25, false, lod + 0.4) * 0.25;
-          od += cloudDensL(p + sunDir*0.7,  false, lod + 0.8) * 0.45;
-          od += cloudDensL(p + sunDir*1.5,  false, lod + 1.2) * 0.8;
-          od += cloudDensL(p + sunDir*3.0,  false, lod + 1.6) * 1.5;
+          od += cloudDensC(p + sunDir*0.25, cc0, false, lod + 0.4) * 0.25;
+          od += cloudDensC(p + sunDir*0.7,  cc0, false, lod + 0.8) * 0.45;
+          od += cloudDensC(p + sunDir*1.5,  cc0, false, lod + 1.2) * 0.8;
+          od += cloudDensC(p + sunDir*3.0,  cc0, false, lod + 1.6) * 1.5;
           od *= SIG;
           float r = length(p); vec3 d = p / r;
           float sd = dot(d, sunDir);
@@ -1237,6 +1256,10 @@ const cloudMat = new THREE.ShaderMaterial({
           // an overcast base stays a textured mid-grey instead of going flat and dark; zero where the sun is direct
           vec3 diffuse = Ts * 0.55 * (1.0 - exp(-0.5 * od)) / (1.0 + 0.11 * od);
           vec3 S = Ts * 1.35 * beer * phase * mix(0.65, 1.0, powder) + diffuse + amb;
+          if(flashOn > 0.0) for(int k = 0; k < 4; k++){
+            vec3 dv = p - flashes[k].xyz;          // a flash lights the cloud around it; thick cloud diffuses it wide
+            S += vec3(0.72, 0.8, 1.0) * flashes[k].w * (exp(-dot(dv, dv) / 30.0) * 14.0 + exp(-dot(dv, dv) / 300.0) * 3.0);
+          }
           float a = 1.0 - exp(-dn * SIG * ds);
           L += T * S * a;
           T *= 1.0 - a;
@@ -1759,26 +1782,11 @@ function buildStorms() {
   storms = [];
   for (let k = 0; k < GW * GH; k++) if (grid.code[k] >= 95) storms.push({ lat: grid.lat[k], lon: grid.lon[k], code: grid.code[k] });
 }
-function fireBolt(dt) {
-  for (const b of bolts) {
-    if (b.life > 0) { b.life -= dt; const a = Math.max(b.life / 0.18, 0); b.line.material.opacity = a; b.spr.material.opacity = a; if (b.life <= 0) b.line.visible = b.spr.visible = false; }
-  }
-  if (!layers.lightning || !glm.n || cam.alt > 0.05) return;
-  // forked bolts only where GOES has actually observed lightning, within ~300 km of the view
-  const now = performance.now();
-  if (!fireBolt.near || now - fireBolt.at > 4000) {
-    const f = focusLatLon(), near = [], cl = Math.cos(f.lat * DEG);
-    for (let k = 0; k < glm.n; k++) if (Math.abs(glm.lat[k] - f.lat) < 2.7 && Math.abs(wrapLon(glm.lon[k] - f.lon)) * cl < 2.7) near.push(k);
-    fireBolt.near = near; fireBolt.at = now;
-  }
-  const near = fireBolt.near;
-  if (!near.length || Math.random() > dt * Math.min(near.length * 0.06, 6)) return;
+const flashes = [];                                // live flashes near the camera
+function strikeBolt(lat, lon, topKm) {
   const b = bolts.find(x => x.life <= 0); if (!b) return;
-  const k = near[Math.floor(Math.random() * near.length)];
-  const lat = glm.lat[k] + (Math.random() - 0.5) * 0.04, lon = glm.lon[k] + (Math.random() - 0.5) * 0.04;
-  const bestTop = cloudAt(lat, lon).top;
   const n = ll2v(lat, lon, 1), e = new THREE.Vector3(n.z, 0, -n.x).normalize(), no = new THREE.Vector3().crossVectors(n, e);
-  const arr = b.line.geometry.attributes.position.array, top = 1 + clamp(bestTop, 5, 12) * 0.6 * KM, bot = surfaceR(lat, lon);
+  const arr = b.line.geometry.attributes.position.array, top = 1 + topKm * KM, bot = surfaceR(lat, lon);
   let ox = 0, oy = 0;
   for (let i = 0; i < 12; i++) {
     const r = lerp(top, bot, i / 11);
@@ -1787,9 +1795,53 @@ function fireBolt(dt) {
     ox += (Math.random() - 0.5) * 0.00012; oy += (Math.random() - 0.5) * 0.00012;
   }
   b.line.geometry.attributes.position.needsUpdate = true;
-  b.spr.position.copy(n).multiplyScalar(top);
-  b.spr.scale.setScalar(0.0012 + Math.random() * 0.0015);
-  b.life = 0.18; b.line.visible = b.spr.visible = true;
+  b.spr.position.copy(n).multiplyScalar(bot + 60 * TERRAIN_K);
+  b.spr.scale.setScalar(0.0008 + Math.random() * 0.0008);
+  b.life = 0.22; b.line.visible = b.spr.visible = true;
+}
+function fireBolt(dt) {
+  for (const b of bolts) {
+    if (b.life > 0) { b.life -= dt; const a = Math.max(b.life / 0.22, 0) * (0.6 + 0.4 * Math.random()); b.line.material.opacity = a; b.spr.material.opacity = a; if (b.life <= 0) b.line.visible = b.spr.visible = false; }
+  }
+  const now = performance.now() / 1000;
+  for (let i = flashes.length - 1; i >= 0; i--) if (now - flashes[i].t0 > 0.7) flashes.splice(i, 1);
+  let on = 0;
+  if (layers.lightning && glm.n && cam.alt < 0.05) {
+    // flashes only where GOES has actually observed lightning, within ~300 km of the view
+    if (!fireBolt.near || now - fireBolt.at > 4) {
+      const f = focusLatLon(), near = [], cl = Math.cos(f.lat * DEG);
+      for (let k = 0; k < glm.n; k++) if (Math.abs(glm.lat[k] - f.lat) < 2.7 && Math.abs(wrapLon(glm.lon[k] - f.lon)) * cl < 2.7) near.push(k);
+      fireBolt.near = near; fireBolt.at = now;
+    }
+    const near = fireBolt.near;
+    if (near.length && flashes.length < 4 && Math.random() < dt * Math.min(0.4 + near.length * 0.05, 5)) {
+      // prefer the closest observed flashes (as seen from inside a storm), but keep some distant ones
+      const f0 = focusLatLon(), cl0 = Math.cos(f0.lat * DEG);
+      let k = near[Math.floor(Math.random() * near.length)];
+      for (let tries = 0; tries < 6; tries++) {
+        const c = near[Math.floor(Math.random() * near.length)];
+        const dk = Math.hypot(glm.lat[k] - f0.lat, wrapLon(glm.lon[k] - f0.lon) * cl0), dc = Math.hypot(glm.lat[c] - f0.lat, wrapLon(glm.lon[c] - f0.lon) * cl0);
+        if (dc < dk) k = c;
+      }
+      const lat = glm.lat[k] + (Math.random() - 0.5) * 0.04, lon = glm.lon[k] + (Math.random() - 0.5) * 0.04;
+      const c = cloudAt(lat, lon), hKm = c.cov > 0.2 ? clamp(c.base + (c.top - c.base) * 0.35, 2, 10) : 6;
+      flashes.push({ p: ll2v(lat, lon, (1 + hKm * KM) * RE_KM), t0: now, amp: 0.6 + Math.random() * 0.8, restrike: 0.18 + Math.random() * 0.2 });
+      if (Math.random() < 0.35) strikeBolt(lat, lon, Math.max(c.cov > 0.2 ? c.base : 2, 1));
+    }
+  }
+  const F = cloudU.flashes.value;
+  for (let i = 0; i < 4; i++) {
+    const fl = flashes[i];
+    if (!fl) { F[i].set(0, 0, 0, 0); continue; }
+    const a = now - fl.t0;                             // return stroke, then a flickering re-strike
+    const w = fl.amp * (Math.exp(-a / 0.07) + 0.55 * Math.exp(-((a - fl.restrike) ** 2) / 0.002)) * (0.8 + 0.2 * Math.random());
+    F[i].set(fl.p.x, fl.p.y, fl.p.z, w); if (w > 0.01) on = 1;
+  }
+  cloudU.flashOn.value = on;
+  // how much the flashes light the scene around the camera (falls off over ~30 km)
+  let amb = 0; const cpk = camera.position.clone().multiplyScalar(RE_KM);
+  for (let i = 0; i < 4; i++) if (F[i].w > 0) { const d = cpk.distanceTo(_tmp.set(F[i].x, F[i].y, F[i].z)); amb += F[i].w / (1 + (d / 30) ** 2); }
+  U.flashAmb.value = Math.min(amb * 0.5, 1.2);
 }
 
 /* ---------- real lightning: NOAA GOES-East GLM group points (Americas + Atlantic) via SSEC RealEarth ---------- */
@@ -1809,6 +1861,8 @@ const glmPts = new THREE.Points(glmGeo, new THREE.ShaderMaterial({
       // each observed lightning group flashes briefly every few seconds, like the storm it came from
       float f = fract(time * 0.35 + aPhase);
       vA = (1.0 - smoothstep(0.0, 0.035, f)) + 0.12 * (1.0 - smoothstep(0.035, 0.09, f));
+      // a map-style dot only from far away; up close the flash is drawn as light inside the real cloud
+      vA *= smoothstep(250.0 / 6371.0, 600.0 / 6371.0, -mv.z);
       gl_PointSize = clamp(12.0 / 6371.0 / max(-mv.z, 1e-6) * uPx, 2.5, 56.0) * (0.6 + 0.4 * vA);
       gl_Position = projectionMatrix * mv;
     }`,
@@ -1834,9 +1888,15 @@ async function pollLightning() {
     const d = await fetchJSON('https://realearth.ssec.wisc.edu/api/shapes?products=glmgrouppoints', 30000);
     const pos = glmGeo.attributes.position.array, ph = glmGeo.attributes.aPhase.array, v = new THREE.Vector3();
     let n = 0, t = 0;
+    const seen = new Map(), cloudy = cloudSat.length > 0;
     for (const f of d.features || []) {
       const c = f.geometry && f.geometry.coordinates; if (!c || n >= MAX_GLM) continue;
-      const lat = c[1], lon = c[0]; if (!isFinite(lat) || !isFinite(lon)) continue;
+      const lat = c[1], lon = c[0]; if (!isFinite(lat) || !isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) continue;   // feed uses -999 as a fill value
+      // GLM false events (sun glint, detector artifacts) repeat at identical coordinates, often in clear sky;
+      // real lightning needs cloud, so drop repeats and points where the satellite sees none
+      const key = lat.toFixed(3) + ',' + lon.toFixed(3), rep = (seen.get(key) || 0) + 1; seen.set(key, rep);
+      if (rep > 3) continue;
+      if (cloudy && cloudAt(lat, lon).cov < 0.05) continue;
       glm.lat[n] = lat; glm.lon[n] = lon;
       ll2v(lat, lon, 1 + 8 * KM, v);             // flashes light the cloud from within, near the tops
       pos[n * 3] = v.x; pos[n * 3 + 1] = v.y; pos[n * 3 + 2] = v.z;
@@ -2184,15 +2244,17 @@ let buildCount = 0;
 const buildU = { ...U, cloudShadow: surfU.cloudShadow };
 const buildMat = new THREE.ShaderMaterial({
   uniforms: buildU,
-  vertexShader: /* glsl */`
+  vertexShader: GLSL_AERIAL_VS + /* glsl */`
     attribute vec3 aCol; attribute vec4 aF;
-    varying vec3 vW; varying vec3 vN; varying vec3 vCol; varying vec4 vF;
+    varying vec3 vW; varying vec3 vN; varying vec3 vCol; varying vec4 vF; varying float vSh;
     void main(){
-      vW = (modelMatrix * vec4(position, 1.0)).xyz; vN = normalize(mat3(modelMatrix) * normal); vCol = aCol; vF = aF;
+      vW = (modelMatrix * vec4(position, 1.0)).xyz; vN = normalize(mat3(modelMatrix) * normal); vCol = aCol; vF = aF; aerial(vW);
+      vSh = groundShadow(normalize(vW));      // cloud shadows vary over km; a building is tens of metres
       gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
     }`,
   fragmentShader: GLSL_COMMON + /* glsl */`
     uniform float cloudShadow;
+    varying vec3 vAL; varying vec3 vAT; varying float vSh;
     varying vec3 vW; varying vec3 vN; varying vec3 vCol; varying vec4 vF;   // vF: facade u (m), height above ground (m), wall flag, building seed
     float h12(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
     void main(){
@@ -2200,7 +2262,7 @@ const buildMat = new THREE.ShaderMaterial({
       float ndl = dot(n, sunDir);
       vec3 Ts = transSun(vW * RE);
       float diff = max(dot(N, sunDir), 0.0);
-      float sh = groundShadow(n) * cloudShadow;
+      float sh = vSh * cloudShadow;
       float up = dot(N, n);
       vec3 amb = skyAmbient(ndl) * (0.75 + 0.45 * up);
       vec3 base = vCol;
@@ -2226,8 +2288,8 @@ const buildMat = new THREE.ShaderMaterial({
       float nightF = 1.0 - smoothstep(-0.12, 0.04, ndl);
       col += lit * nightF * vec3(1.0, 0.78, 0.46) * 0.95;
       col += base * nightF * vec3(1.0, 0.8, 0.6) * 0.035;                   // city light pollution on walls and roofs
-      vec3 L, T;
-      atmo(cameraPosition * RE, -V, length(cameraPosition - vW) * RE, L, T);
+      col += base * vec3(0.72, 0.78, 1.0) * flashAmb * 0.9;
+      vec3 L = vAL, T = vAT;
       gl_FragColor = vec4(shoulder(col * T + skyTone(L * HAZE)), 1.0);
     }`,
   extensions: { derivatives: true }
@@ -2339,18 +2401,19 @@ const ROAD = {   // width (m), asphalt colour, centre marking, street lighting
 };
 const roadMat = new THREE.ShaderMaterial({
   uniforms: buildU,
-  vertexShader: /* glsl */`
+  vertexShader: GLSL_AERIAL_VS + /* glsl */`
     attribute vec3 aCol; attribute vec4 aF;
-    varying vec3 vW; varying vec3 vCol; varying vec4 vF;
-    void main(){ vW = (modelMatrix * vec4(position, 1.0)).xyz; vCol = aCol; vF = aF; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+    varying vec3 vW; varying vec3 vCol; varying vec4 vF; varying float vSh;
+    void main(){ vW = (modelMatrix * vec4(position, 1.0)).xyz; vCol = aCol; vF = aF; aerial(vW); vSh = groundShadow(normalize(vW)); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
   fragmentShader: GLSL_COMMON + /* glsl */`
     uniform float cloudShadow;
+    varying vec3 vAL; varying vec3 vAT; varying float vSh;
     varying vec3 vW; varying vec3 vCol; varying vec4 vF;   // vF: distance along (m), across (-1..1), marking flag, lit flag
     void main(){
       vec3 n = normalize(vW);
       float ndl = dot(n, sunDir);
       vec3 Ts = transSun(vW * RE);
-      float sh = groundShadow(n) * cloudShadow;
+      float sh = vSh * cloudShadow;
       vec3 base = vCol;
       float aa = fwidth(vF.y) * 1.5;
       // dashed centre line and solid edge lines on marked roads
@@ -2363,8 +2426,7 @@ const roadMat = new THREE.ShaderMaterial({
       float pool = 0.35 + 0.65 * pow(max(0.5 + 0.5 * cos(vF.x / 30.0 * 6.2832), 0.0), 3.0);
       col += vF.w * nightF * vec3(1.0, 0.72, 0.38) * 0.32 * pool * (1.0 - 0.5 * abs(vF.y));
       vec3 V = normalize(cameraPosition - vW);
-      vec3 L, T;
-      atmo(cameraPosition * RE, -V, length(cameraPosition - vW) * RE, L, T);
+      vec3 L = vAL, T = vAT;
       gl_FragColor = vec4(shoulder(col * T + skyTone(L * HAZE)), 1.0);
     }`,
   polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -6,
@@ -4299,7 +4361,7 @@ function frame() {
 /* =====================================================================
    BOOT
    ===================================================================== */
-if (/[?&]debug\b/.test(location.search)) window.__mw = { flyTo, cam, camera, tiles, wikiNear, cloudAt, decodeIR, irTemp, glm, get flArr() { return flArr; }, ride(f) { selected = f; setMode("plane", false, true); }, get shipArr() { return shipArr; }, get trainArr() { return trainArr; }, get nycLinks() { return nycLinks; }, showShipCard, showTrainCard, showNYCCard, get alt() { return camera.position.length() - 1; } };
+if (/[?&]debug\b/.test(location.search)) window.__mw = { get flashes() { return flashes; }, cloudU, renderer, scene, tileGroup, buildGroup, roadGroup, earth, cloudShell, sky, flyTo, cam, camera, tiles, wikiNear, cloudAt, decodeIR, irTemp, glm, get flArr() { return flArr; }, ride(f) { selected = f; setMode("plane", false, true); }, get shipArr() { return shipArr; }, get trainArr() { return trainArr; }, get nycLinks() { return nycLinks; }, showShipCard, showTrainCard, showNYCCard, get alt() { return camera.position.length() - 1; } };
 (async function boot() {
   const [day, night, topo, water] = await Promise.all([
     loadTex('earth-blue-marble.jpg', solidTex(18, 52, 96)), loadTex('earth-night.jpg', solidTex(0, 0, 0)),
