@@ -504,7 +504,7 @@ vec2 rsi(vec3 ro, vec3 rd, float R){
 float chapman(float X, float h, float mu){
   float c = sqrt(X + h);
   if(mu >= 0.0) return c / (c*mu + 1.0) * exp(-h);
-  float x0 = sqrt(1.0 - mu*mu) * (X + h);
+  float x0 = sqrt(max(1.0 - mu*mu, 0.0)) * (X + h);   // rounding can put |mu| a hair past 1
   float c0 = sqrt(x0);
   return 2.0*c0*exp(X - x0) - c / (1.0 - c*mu) * exp(-h);
 }
