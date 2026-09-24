@@ -1134,12 +1134,19 @@ function makeNoise3D(S) {
 }
 U.noise3.value = makeNoise3D(64);
 
-const cloudU = { ...U, opacity: { value: 1 }, steps: { value: 56 } };
+const cloudU = { ...U, opacity: { value: 1 }, steps: { value: 56 }, inShell: { value: 0 } };
 const cloudMat = new THREE.ShaderMaterial({
   uniforms: cloudU,
   vertexShader: /* glsl */`
+    uniform float inShell;
     varying vec3 vPos;
-    void main(){ vPos = (modelMatrix*vec4(position,1.0)).xyz; gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
+    void main(){
+      vPos = (modelMatrix*vec4(position,1.0)).xyz;
+      gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0);
+      // from inside the layer, rays looking down meet the shell on the far side of the planet, beyond the far
+      // plane: skip depth clipping there (depth test is off in this mode; the shell only supplies ray directions)
+      if(inShell > 0.5) gl_Position.z = 0.0;
+    }`,
   fragmentShader: GLSL_COMMON + /* glsl */`
     uniform float opacity, steps;
     varying vec3 vPos;
@@ -1184,7 +1191,7 @@ const cloudMat = new THREE.ShaderMaterial({
         float tt = t0 + (float(i) + jitter) * ds;
         vec3 p = ro + rd * tt;
         float lod = noiseLod(max(tt * pixAng, ds));   // band-limit to the pixel AND the step, or long grazing rays alias into streaks
-        float dn = cloudDensL(p, true, lod) * smoothstep(0.4, 2.5, tt);   // thin out cloud right at the eye
+        float dn = cloudDensL(p, true, lod) * mix(0.18, 1.0, smoothstep(0.02, 1.2, tt));   // inside a cloud: murky fog you can see a little way into, not a hole or a white-out
         if(dn > 0.001){
           if(tHit < 0.0) tHit = tt;
           float od = 0.0;
@@ -3128,7 +3135,7 @@ function updateISS() {
    CAMERA CONTROL (earth-fixed "window": the world stays true to reality)
    ===================================================================== */
 const MIN_ALT = 0.00004, MAX_ALT = 8;      // ~250 m … 51,000 km
-const cam = { lat: 25, lon: wrapLon(-new Date().getTimezoneOffset() / 4), alt: 2.6, hd: 0, tiltAdj: 0, vLat: 0, vLon: 0 };
+const cam = { lat: 25, lon: wrapLon(-new Date().getTimezoneOffset() / 4), alt: 2.6, hd: 0, tiltAdj: 0, pitchUp: 0, vLat: 0, vLon: 0 };
 const camGoal = { pos: new THREE.Vector3(), look: new THREE.Vector3(), up: new THREE.Vector3(0, 1, 0) };
 const camLook = new THREE.Vector3(), camUp = new THREE.Vector3(0, 1, 0);
 let camFollow = 14, fly = null;
@@ -3148,6 +3155,15 @@ function orbitGoal() {
   if (camGoal.pos.length() < minR) camGoal.pos.setLength(minR);
   camGoal.look.copy(T);
   camGoal.up.copy(fwd).multiplyScalar(Math.cos(tilt)).addScaledVector(n, Math.sin(tilt)).normalize();
+  if (cam.alt > 0.01) cam.pitchUp = Math.max(0, cam.pitchUp - 0.05);   // free look is for near the ground
+  if (cam.pitchUp > 0) {
+    // raise the gaze above the orbit target: look up at the sky and the clouds from low altitude
+    const d = new THREE.Vector3().subVectors(T, camGoal.pos), dist = d.length(); d.normalize();
+    const u = camGoal.up.clone(), c = Math.cos(cam.pitchUp), sn = Math.sin(cam.pitchUp);
+    const dN = d.clone().multiplyScalar(c).addScaledVector(u, sn);
+    camGoal.up.copy(u.multiplyScalar(c).addScaledVector(d, -sn)).normalize();
+    camGoal.look.copy(camGoal.pos).addScaledVector(dN, dist);
+  }
 }
 function focusLatLon() {
   if (mode === 'plane' && selected) return { lat: selected.cLat ?? selected.lat, lon: selected.cLon ?? selected.lon };
@@ -3193,7 +3209,15 @@ canvas.addEventListener('pointermove', e => {
     pinchD = d; return;
   }
   if (mode === 'plane' || mode === 'iss') { rideOrbit.yaw -= dx * 0.006; rideOrbit.pitch = clamp(rideOrbit.pitch + dy * 0.004, -0.3, 1.4); return; }
-  if (dragBtn === 2 || e.shiftKey) { cam.hd = (cam.hd - dx * 0.3 + 360) % 360; cam.tiltAdj = clamp(cam.tiltAdj - dy * 0.005, -0.8, 1.4); return; }
+  if (dragBtn === 2 || e.shiftKey) {
+    cam.hd = (cam.hd - dx * 0.3 + 360) % 360;
+    const d = -dy * 0.005;
+    // at full tilt near the ground, keep dragging to look up past the horizon; drag back to come down again
+    if (d > 0 && cam.alt < 0.01 && tiltFor(cam.alt) >= 79.5 * DEG) cam.pitchUp = Math.min(cam.pitchUp + d, 1.45);
+    else if (d < 0 && cam.pitchUp > 0) cam.pitchUp = Math.max(cam.pitchUp + d, 0);
+    else cam.tiltAdj = clamp(cam.tiltAdj + d, -0.8, 1.4);
+    return;
+  }
   const k = 0.085 * Math.max(cam.alt, 0.00002) * (700 / innerHeight);
   const h = cam.hd * DEG, fwdAmt = dy * k, rightAmt = -dx * k;
   const dN = fwdAmt * Math.cos(h) - rightAmt * Math.sin(h), dE = fwdAmt * Math.sin(h) + rightAmt * Math.cos(h);
@@ -3724,7 +3748,7 @@ function updateCamera(dt) {
   // inside the atmosphere / cloud layer we look at the shells from within
   const inAtmo = cd < 1 + ATMO_KM * KM, inCloud = cd < CLOUD_SHELL_R;
   skyMat.side = inAtmo ? THREE.BackSide : THREE.FrontSide;
-  cloudMat.side = inCloud ? THREE.BackSide : THREE.FrontSide; cloudMat.depthTest = !inCloud;
+  cloudMat.side = inCloud ? THREE.BackSide : THREE.FrontSide; cloudMat.depthTest = !inCloud; cloudU.inShell.value = inCloud ? 1 : 0;
   U.pixAng.value = 2 * Math.tan(camera.fov * DEG / 2) / (innerHeight * renderer.getPixelRatio());
   U.windOff.value.x += dt * 0.012; U.windOff.value.z += dt * 0.005;           // slow churn of cloud detail (km)
   U.cloudAge.value = cloudTime ? clamp((Date.now() - cloudTime) / 1000, 0, 3 * 3600) : 0;
@@ -3791,7 +3815,7 @@ function frame() {
 /* =====================================================================
    BOOT
    ===================================================================== */
-if (/[?&]debug\b/.test(location.search)) window.__mw = { flyTo, cam, camera, tiles, wikiNear, get shipArr() { return shipArr; }, get trainArr() { return trainArr; }, get nycLinks() { return nycLinks; }, showShipCard, showTrainCard, showNYCCard, get alt() { return camera.position.length() - 1; } };
+if (/[?&]debug\b/.test(location.search)) window.__mw = { flyTo, cam, camera, tiles, wikiNear, cloudAt, get shipArr() { return shipArr; }, get trainArr() { return trainArr; }, get nycLinks() { return nycLinks; }, showShipCard, showTrainCard, showNYCCard, get alt() { return camera.position.length() - 1; } };
 (async function boot() {
   const [day, night, topo, water] = await Promise.all([
     loadTex('earth-blue-marble.jpg', solidTex(18, 52, 96)), loadTex('earth-night.jpg', solidTex(0, 0, 0)),
