@@ -4299,7 +4299,7 @@ function frame() {
 /* =====================================================================
    BOOT
    ===================================================================== */
-if (/[?&]debug\b/.test(location.search)) window.__mw = { flyTo, cam, camera, tiles, wikiNear, cloudAt, decodeIR, irTemp, glm, get shipArr() { return shipArr; }, get trainArr() { return trainArr; }, get nycLinks() { return nycLinks; }, showShipCard, showTrainCard, showNYCCard, get alt() { return camera.position.length() - 1; } };
+if (/[?&]debug\b/.test(location.search)) window.__mw = { flyTo, cam, camera, tiles, wikiNear, cloudAt, decodeIR, irTemp, glm, get flArr() { return flArr; }, ride(f) { selected = f; setMode("plane", false, true); }, get shipArr() { return shipArr; }, get trainArr() { return trainArr; }, get nycLinks() { return nycLinks; }, showShipCard, showTrainCard, showNYCCard, get alt() { return camera.position.length() - 1; } };
 (async function boot() {
   const [day, night, topo, water] = await Promise.all([
     loadTex('earth-blue-marble.jpg', solidTex(18, 52, 96)), loadTex('earth-night.jpg', solidTex(0, 0, 0)),
