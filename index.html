@@ -585,6 +585,8 @@ float cloudDensL(vec3 p, bool detail, float lod){
   float cov = c.r;
   if(cov < 0.03) return 0.0;
   float top = c.g * 16.0, base = c.b * 16.0;
+  // ripple the cloud base (only ever lowered, within the march's 0.4 km margin) so it isn't a flat ceiling
+  base = max(base - 0.35 * textureLod(noise3, p / 12.0 + vec3(0.7, 0.2, 0.5), 1.0).r, C_BOT);
   float h = (hk - base) / max(top - base, 0.35);
   if(h < 0.0 || h > 1.0) return 0.0;
   bool cirrus = base > 5.5;
@@ -599,6 +601,9 @@ float cloudDensL(vec3 p, bool detail, float lod){
     float e = mix(0.55, textureLod(noise3, q * 4.3 + 0.37, lod + 2.1).g, (1.0 - smoothstep(0.6, 3.2, lod)));
     dn = remap(dn, (1.0 - e) * 0.38, 1.0, 0.0, 1.0);
   }
+  // cellular thinning (~5-10 km cells, inverted Worley): even a 100% deck shows the lighter gaps and darker
+  // cells of a real stratocumulus base instead of a flat grey sheet
+  if(!cirrus) dn *= mix(0.45, 1.0, smoothstep(0.25, 0.75, textureLod(noise3, p / 9.0 + vec3(0.2, 0.8, 0.4), max(lod - 1.0, 0.0)).b));
   return clamp(dn, 0.0, 1.0) * (cirrus ? 0.09 : 1.0);
 }
 float cloudDens(vec3 p, bool detail){ return cloudDensL(p, detail, 0.0); }
@@ -1186,12 +1191,15 @@ const cloudMat = new THREE.ShaderMaterial({
       float phase = mix(hg(mu, 0.75), hg(mu, -0.25), 0.5) * 4.0*PI + 0.55;   // + isotropic multiple scattering
       float T = 1.0; vec3 L = vec3(0.0);
       float tHit = -1.0;
+      // inside a cloud, thin it near the eye so you see murky fog rather than a white wall; below or above
+      // a cloud, nearby cloud keeps full density so a base just overhead stays visible
+      float nearLo = cloudDensL(ro, false, 2.0) > 0.02 ? 0.18 : 1.0;
       for(int i = 0; i < 96; i++){
         if(float(i) >= nSteps) break;
         float tt = t0 + (float(i) + jitter) * ds;
         vec3 p = ro + rd * tt;
         float lod = noiseLod(max(tt * pixAng, ds));   // band-limit to the pixel AND the step, or long grazing rays alias into streaks
-        float dn = cloudDensL(p, true, lod) * mix(0.18, 1.0, smoothstep(0.02, 1.2, tt));   // inside a cloud: murky fog you can see a little way into, not a hole or a white-out
+        float dn = cloudDensL(p, true, lod) * mix(nearLo, 1.0, smoothstep(0.02, 1.2, tt));
         if(dn > 0.001){
           if(tHit < 0.0) tHit = tt;
           float od = 0.0;
@@ -1207,7 +1215,10 @@ const cloudMat = new THREE.ShaderMaterial({
           float powder = 1.0 - exp(-dn * SIG * 0.6);
           float hf = clamp((r - RE - 0.5) / 10.0, 0.0, 1.0);
           vec3 sa = skyAmbient(sd); vec3 amb = mix(sa, vec3(dot(sa, vec3(0.33))), 0.5) * (1.6 + 1.2 * hf);
-          vec3 S = Ts * 1.35 * beer * phase * mix(0.65, 1.0, powder) + amb;
+          // light that diffuses through thick cloud by many scatterings (two-stream estimate, ~1/(1+0.75*tau*(1-g))):
+          // an overcast base stays a textured mid-grey instead of going flat and dark; zero where the sun is direct
+          vec3 diffuse = Ts * 0.55 * (1.0 - exp(-0.5 * od)) / (1.0 + 0.11 * od);
+          vec3 S = Ts * 1.35 * beer * phase * mix(0.65, 1.0, powder) + diffuse + amb;
           float a = 1.0 - exp(-dn * SIG * ds);
           L += T * S * a;
           T *= 1.0 - a;
@@ -1499,7 +1510,13 @@ function smoothCloudMap() {
     cloudData[o] = c / wc; cloudData[o + 1] = t / ww; cloudData[o + 2] = b / ww;
   }
 }
-function cloudAt(lat, lon) {     // CPU lookup for cards
+function cloudAt(lat, lon) {     // CPU lookup for cards: same wind drift as the renderer (cloudUv)
+  const age = U.cloudAge.value;
+  if (age > 0 && grid.ok) {
+    const u = clamp(gridSample(grid.u, lat, lon), -25, 25) * 2, v = clamp(gridSample(grid.v, lat, lon), -25, 25) * 2;
+    lon -= u * age / (2 * Math.PI * EARTH_M * Math.max(Math.cos(lat * DEG), 0.2)) * 360;
+    lat -= v * age / (Math.PI * EARTH_M) * 180;
+  }
   const x = clamp(Math.floor((wrapLon(lon) + 180) / 360 * CMW), 0, CMW - 1), y = clamp(Math.floor((lat + 90) / 180 * CMH), 0, CMH - 1);
   const o = (y * CMW + x) * 4;
   return { cov: cloudData[o] / 255, top: cloudData[o + 1] / 255 * 16, base: cloudData[o + 2] / 255 * 16, sat: cloudData[o + 3] > 127 };
