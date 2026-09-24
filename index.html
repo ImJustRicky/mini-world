@@ -422,6 +422,7 @@ scene.add(hemi);
 const U = {
   time: { value: 0 },
   frameN: { value: 0 },
+  cloudMax: { value: null }, useMax: { value: 1 },
   flashAmb: { value: 0 },
   sunDir: { value: sunDir },
   cloudMap: { value: null },
@@ -438,6 +439,8 @@ const GLSL_COMMON = /* glsl */`
 #define PI 3.141592653589793
 uniform float time;
 uniform float frameN;
+uniform sampler2D cloudMax;    // max cloud cover per ~150 km cell, dilated: < 0.012 means no cloud can be here
+uniform float useMax;
 uniform float flashAmb;       // light from nearby lightning washing over the ground
 uniform vec3 sunDir;
 uniform sampler2D cloudMap;   // r = cloud cover, g = top height /16 km, b = base height /16 km, a = source (1 satellite, 0 model)
@@ -581,6 +584,8 @@ vec2 cloudUv(vec3 d){
 }
 // the cloud map is ~20 km per pixel: warp its lookup with ~160 km noise and perturb partial cover so
 // field edges break up like real cloud fields instead of showing the grid (solid and clear areas stay as observed)
+// exact early-out: the cover map (after its warp and perturbation) cannot reach the 0.03 density threshold here
+bool cloudFree(vec3 p){ return useMax > 0.5 && texture2D(cloudMax, cloudUv(normalize(p))).r < 0.012; }
 vec4 cloudCol(vec3 p){
   vec3 w = textureLod(noise3, p / 160.0 + vec3(0.13, 0.71, 0.37), 1.5).rgb - 0.5;
   vec4 c = texture2D(cloudMap, cloudUv(normalize(p + w * 44.0)));
@@ -627,7 +632,7 @@ float cloudDensC(vec3 p, vec4 c, bool detail, float lod){
 }
 float cloudDensL(vec3 p, bool detail, float lod){
   float hk = length(p) - RE;
-  if(hk < C_BOT || hk > C_TOP) return 0.0;
+  if(hk < C_BOT || hk > C_TOP || cloudFree(p)) return 0.0;
   return cloudDensC(p, cloudCol(p), detail, lod);
 }
 float cloudDens(vec3 p, bool detail){ return cloudDensL(p, detail, 0.0); }
@@ -1045,6 +1050,10 @@ function buildTileTexture(t, img, dem, zE, ex, ey) {
   tex.needsUpdate = true;
   return tex;
 }
+// resolve on a fresh macrotask (MessageChannel is not throttled like setTimeout)
+const taskCh = new MessageChannel(), taskQ = [];
+taskCh.port1.onmessage = () => { const r = taskQ.shift(); if (r) r(); };
+function nextTask() { return new Promise(r => { taskQ.push(r); taskCh.port2.postMessage(0); }); }
 async function loadTile(t) {
   tileLoads++; t.state = 'loading';
   const zE = Math.min(t.z, DEM_MAX_Z), sh = t.z - zE, ex = t.x >> sh, ey = t.y >> sh;
@@ -1067,7 +1076,9 @@ async function loadTile(t) {
       u.value = buildTileTexture(t, real, dem.data ? dem : null, zE, ex, ey);
       old.dispose(); t.vectorFallback = false;
     });
+    await nextTask();                               // one heavy step per task: frames keep drawing while tiles stream in
     const tex = buildTileTexture(t, img, dem.data ? dem : null, zE, ex, ey);
+    await nextTask();
     const geo = buildTileGeo(t, dem.data ? dem : null, zE, ex, ey);
     const mat = new THREE.ShaderMaterial({ uniforms: { ...tileU, map: { value: tex }, hasDem: { value: dem.data ? 1 : 0 } }, vertexShader: TILE_VS, fragmentShader: TILE_FS });
     t.mesh = new THREE.Mesh(geo, mat);
@@ -1229,13 +1240,16 @@ const cloudMat = new THREE.ShaderMaterial({
       // inside a cloud, thin it near the eye so you see murky fog rather than a white wall; below or above
       // a cloud, nearby cloud keeps full density so a base just overhead stays visible
       float nearLo = cloudDensL(ro, false, 2.0) > 0.02 ? 0.18 : 1.0;
+      bool mayBeFree = useMax > 0.5;
       for(int i = 0; i < 96; i++){
         if(float(i) >= nSteps) break;
         float tt = t0 + (float(i) + jitter) * ds;
         vec3 p = ro + rd * tt;
         float lod = noiseLod(max(tt * pixAng, ds));   // band-limit to the pixel AND the step, or long grazing rays alias into streaks
         float hk0 = length(p) - RE;
-        vec4 cc0 = (hk0 < C_BOT || hk0 > C_TOP) ? vec4(0.0) : cloudCol(p);
+        bool fr = false;
+        if(mayBeFree){ fr = cloudFree(p); if(!fr) mayBeFree = false; }   // stop checking once cloud is near: no overhead in cloudy views
+        vec4 cc0 = (hk0 < C_BOT || hk0 > C_TOP || fr) ? vec4(0.0) : cloudCol(p);
         float dn = cloudDensC(p, cc0, true, lod) * mix(nearLo, 1.0, smoothstep(0.02, 1.2, tt));
         if(dn > 0.001){
           if(tHit < 0.0) tHit = tt;
@@ -1510,6 +1524,30 @@ const cloudData = new Uint8Array(CMW * CMH * 4);
 const cloudTex = new THREE.DataTexture(cloudData, CMW, CMH, THREE.RGBAFormat);
 cloudTex.magFilter = cloudTex.minFilter = THREE.LinearFilter; cloudTex.wrapS = THREE.RepeatWrapping; cloudTex.wrapT = THREE.ClampToEdgeWrapping; cloudTex.needsUpdate = true;
 U.cloudMap.value = cloudTex;
+const CXW = 256, CXH = 128, cloudMaxData = new Uint8Array(CXW * CXH * 4);
+const cloudMaxTex = new THREE.DataTexture(cloudMaxData, CXW, CXH, THREE.RGBAFormat);
+cloudMaxTex.magFilter = cloudMaxTex.minFilter = THREE.NearestFilter; cloudMaxTex.wrapS = THREE.RepeatWrapping; cloudMaxTex.wrapT = THREE.ClampToEdgeWrapping; cloudMaxTex.needsUpdate = true;
+U.cloudMax.value = cloudMaxTex;
+function buildCloudMax() {
+  const fx = CMW / CXW, fy = CMH / CXH, cell = new Uint8Array(CXW * CXH);
+  for (let y = 0; y < CMH; y++) for (let x = 0; x < CMW; x++) {
+    const k = ((y / fy) | 0) * CXW + ((x / fx) | 0), v = cloudData[(y * CMW + x) * 4];
+    if (v > cell[k]) cell[k] = v;
+  }
+  // dilate so the shader's ~40 km lookup warp and bilinear filtering can never reach a cloud outside the cell
+  for (let cy = 0; cy < CXH; cy++) {
+    const lat = -90 + (cy + 0.5) * 180 / CXH, rx = Math.min(CXW >> 1, Math.ceil(0.5 + 45 / (156 * Math.max(Math.cos(lat * DEG), 0.004))));
+    for (let cx = 0; cx < CXW; cx++) {
+      let m = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        const yy = cy + dy; if (yy < 0 || yy >= CXH) continue;
+        for (let dx = -rx; dx <= rx; dx++) { const v = cell[yy * CXW + (cx + dx + CXW) % CXW]; if (v > m) m = v; }
+      }
+      cloudMaxData[(cy * CXW + cx) * 4] = m;
+    }
+  }
+  cloudMaxTex.needsUpdate = true;
+}
 let cloudSat = [], cloudTime = 0, cloudBuilding = false;
 const irCanvas = document.createElement('canvas'); irCanvas.width = CMW; irCanvas.height = CMH;
 const irCtx = irCanvas.getContext('2d', { willReadFrequently: true });
@@ -1593,6 +1631,7 @@ async function buildCloudMap(sats) {
   }
   smoothCloudMap();
   cloudTex.needsUpdate = true;
+  buildCloudMax();
   if (sats.length) { cloudSat = sats.map(s => s.name); cloudTime = Math.min(...sats.map(s => s.time)); }
   else cloudTime = Date.now();
   cloudBuilding = false;
@@ -2204,6 +2243,22 @@ function decodeMVT(ab, want) {
 const vtCache = new Map();
 let vtLoads = 0;
 const vtQueue = [];
+// decode map tiles in a background worker so moving and zooming never stall on protobuf parsing
+let mvtWorker = null, mvtSeq = 0;
+const mvtWait = new Map();
+try {
+  const src = 'const utf8d = new TextDecoder();\n' + [pbVarint, pbSkip, pbValue, pbPacked, decodeMVT].map(f => f.toString()).join('\n') +
+    '\nonmessage = e => { let data = null; try { data = decodeMVT(e.data.ab, e.data.want); } catch (err) { data = null; } postMessage({ id: e.data.id, data }); };';
+  mvtWorker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+  mvtWorker.onmessage = e => { const cb = mvtWait.get(e.data.id); mvtWait.delete(e.data.id); if (cb) cb(e.data.data); };
+  mvtWorker.onerror = () => { mvtWorker = null; for (const [id, cb] of mvtWait) cb(undefined); mvtWait.clear(); };
+} catch (err) { mvtWorker = null; }
+function decodeOffThread(ab, want) {
+  if (!mvtWorker) return Promise.resolve(decodeMVT(ab, want));
+  const copy = ab.slice(0);                         // keep a copy in case the worker fails and we decode here
+  return new Promise(res => { const id = ++mvtSeq; mvtWait.set(id, d => res(d === undefined ? decodeMVT(copy, want) : d)); mvtWorker.postMessage({ id, ab, want }, [ab]); })
+    .then(d => { if (!d) throw new Error('decode'); return d; });
+}
 function vtRequest(z, x, y, prio) {
   const k = `${z}/${x}/${y}`;
   let e = vtCache.get(k);
@@ -2223,7 +2278,8 @@ function vtPump() {
     const e = vtQueue.shift();
     e.state = 'loading'; vtLoads++;
     fetchBuf(ofmTemplate.replace('{z}', e.z).replace('{x}', e.x).replace('{y}', e.y))
-      .then(ab => { e.data = decodeMVT(ab, ['building', 'poi', 'place', 'transportation', 'water', 'landcover', 'landuse', 'park']); e.state = 'ready'; e.cbs.forEach(cb => cb(e)); e.cbs = []; })
+      .then(ab => decodeOffThread(ab, ['building', 'poi', 'place', 'transportation', 'water', 'landcover', 'landuse', 'park']))
+      .then(data => { e.data = data; e.state = 'ready'; e.cbs.forEach(cb => cb(e)); e.cbs = []; })
       .catch(() => { e.state = 'error'; e.retry = performance.now() + 15000; })
       .finally(() => { vtLoads--; });
   }
@@ -2614,12 +2670,17 @@ function updateMapData(now, alt, focus) {
   const showB = layers.buildings && alt < 0.0015, showR = layers.roads && alt < 0.0015;
   const bTiles = new Set();
   if (showB || showR || (layers.landmarks && alt < 0.0015)) {
+    // nearest tiles first, and at most ~6 ms of mesh building per frame: the rest continues next frame
+    const t0 = performance.now(); let pending = false;
     for (const e of need(BZ, clamp(alt * RE_KM * 1.3, 1.0, 4.5), 0, 16)) {
       bTiles.add(e);
-      if (e.state === 'ready' && !e.ingested) { e.ingested = true; ingestTileLabels(e); }
-      if (e.state === 'ready' && showB && e.mesh === undefined) { e.mesh = buildTileMesh(e); if (e.mesh) buildGroup.add(e.mesh); }
-      if (e.state === 'ready' && showR && e.roadMesh === undefined) { e.roadMesh = buildRoadMesh(e); if (e.roadMesh) roadGroup.add(e.roadMesh); }
+      if (e.state !== 'ready') continue;
+      if (performance.now() - t0 > 6) { pending = true; continue; }
+      if (!e.ingested) { e.ingested = true; ingestTileLabels(e); }
+      if (showB && e.mesh === undefined) { e.mesh = buildTileMesh(e); if (e.mesh) buildGroup.add(e.mesh); }
+      if (showR && e.roadMesh === undefined) { e.roadMesh = buildRoadMesh(e); if (e.roadMesh) roadGroup.add(e.roadMesh); }
     }
+    if (pending) lastMapUpd = now - 340;              // come back on the next frame, not in 350 ms
   }
   buildCount = 0;
   for (const e of vtCache.values()) {
@@ -4361,7 +4422,7 @@ function frame() {
 /* =====================================================================
    BOOT
    ===================================================================== */
-if (/[?&]debug\b/.test(location.search)) window.__mw = { get flashes() { return flashes; }, cloudU, renderer, scene, tileGroup, buildGroup, roadGroup, earth, cloudShell, sky, flyTo, cam, camera, tiles, wikiNear, cloudAt, decodeIR, irTemp, glm, get flArr() { return flArr; }, ride(f) { selected = f; setMode("plane", false, true); }, get shipArr() { return shipArr; }, get trainArr() { return trainArr; }, get nycLinks() { return nycLinks; }, showShipCard, showTrainCard, showNYCCard, get alt() { return camera.position.length() - 1; } };
+if (/[?&]debug\b/.test(location.search)) window.__mw = { U, get flashes() { return flashes; }, cloudU, renderer, scene, tileGroup, buildGroup, roadGroup, earth, cloudShell, sky, flyTo, cam, camera, tiles, wikiNear, cloudAt, decodeIR, irTemp, glm, get flArr() { return flArr; }, ride(f) { selected = f; setMode("plane", false, true); }, get shipArr() { return shipArr; }, get trainArr() { return trainArr; }, get nycLinks() { return nycLinks; }, showShipCard, showTrainCard, showNYCCard, get alt() { return camera.position.length() - 1; } };
 (async function boot() {
   const [day, night, topo, water] = await Promise.all([
     loadTex('earth-blue-marble.jpg', solidTex(18, 52, 96)), loadTex('earth-night.jpg', solidTex(0, 0, 0)),
