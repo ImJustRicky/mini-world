@@ -99,6 +99,11 @@
     font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:rgba(255,255,255,.85);text-shadow:0 1px 3px rgba(0,0,0,.95)}
   .plc.big{font-size:12.5px;color:#fff}
   .plc.ctry{font-size:10px;font-weight:500;letter-spacing:.18em;color:rgba(255,255,255,.55)}
+  .cyc{position:absolute;left:0;top:0;display:none;flex-direction:column;align-items:center;pointer-events:auto;cursor:pointer;white-space:nowrap;
+    text-shadow:0 1px 3px rgba(0,0,0,.95)}
+  .cyc b{font-size:12.5px;font-weight:700;letter-spacing:.06em;color:#ffd9a8}
+  .cyc span{font-size:10px;font-weight:500;color:rgba(255,255,255,.8)}
+  .cyc:hover b{text-decoration:underline}
 
   #credit{position:fixed;right:12px;bottom:6px;font-size:10px;color:rgba(238,240,246,.4);pointer-events:none;z-index:3;text-shadow:0 1px 2px rgba(0,0,0,.8)}
   #tag{position:fixed;pointer-events:none;transform:translate(-50%,-160%);background:rgba(255,255,255,.92);color:#0b0e1a;font-weight:600;font-size:11px;
@@ -140,7 +145,9 @@
   <div class="sec">Atmosphere &amp; weather</div>
   <button class="chip on" data-l="clouds">Clouds (satellite)<i class="sw"></i></button>
   <button class="chip on" data-l="radar">Rain radar<i class="sw"></i></button>
-  <button class="chip on" data-l="rain">Rain, snow &amp; lightning<i class="sw"></i></button>
+  <button class="chip on" data-l="rain">Rain &amp; snow<i class="sw"></i></button>
+  <button class="chip on" data-l="lightning">Lightning (GOES, live)<i class="sw"></i></button>
+  <button class="chip on" data-l="cyclones">Hurricanes &amp; typhoons<i class="sw"></i></button>
   <button class="chip" data-l="wind">Wind<i class="sw"></i></button>
   <button class="chip" data-l="temp">Temperature<i class="sw"></i></button>
   <div id="legend"><div class="bar"></div><div class="ticks"><span>-40°</span><span>0°</span><span>20°</span><span>40°C</span></div></div>
@@ -164,6 +171,8 @@
 <div id="statusPop" class="pop glass">
   <div class="srow"><span class="dot load" id="dWx"></span><span class="n">Weather</span><span class="val" id="sWx">Loading</span></div>
   <div class="srow"><span class="dot load" id="dCl"></span><span class="n">Clouds</span><span class="val" id="sCl">Loading</span></div>
+  <div class="srow"><span class="dot idle" id="dLit"></span><span class="n">Lightning</span><span class="val" id="sLit">Off</span></div>
+  <div class="srow"><span class="dot idle" id="dCyc"></span><span class="n">Cyclones</span><span class="val" id="sCyc">Off</span></div>
   <div class="srow"><span class="dot load" id="dRad"></span><span class="n">Radar</span><span class="val" id="sRad">Loading</span></div>
   <div class="srow"><span class="dot load" id="dFl"></span><span class="n">Aircraft</span><span class="val" id="sFl">Loading</span></div>
   <div class="srow"><span class="dot idle" id="dShip"></span><span class="n">Ships</span><span class="val" id="sShip">Off</span></div>
@@ -192,7 +201,7 @@
 <div id="tag"></div>
 <div id="tip" class="glass"></div>
 <div id="toast" class="glass"></div>
-<div id="credit">Imagery © Esri, Maxar, Earthstar · Sentinel-2 cloudless by EOX · Terrain © Mapzen/AWS · Clouds NASA GIBS (GOES, Himawari) · Weather Open-Meteo · © OpenStreetMap contributors · Orbits CelesTrak · Ships &amp; trains Fintraffic/Digitraffic (CC BY 4.0) · Road speeds NYC DOT</div>
+<div id="credit">Imagery © Esri, Maxar, Earthstar · Sentinel-2 cloudless by EOX · Terrain © Mapzen/AWS · Clouds NASA GIBS (GOES, Himawari) · Weather Open-Meteo · © OpenStreetMap contributors · Orbits CelesTrak · Ships &amp; trains Fintraffic/Digitraffic (CC BY 4.0) · Road speeds NYC DOT · Lightning NOAA GOES GLM via SSEC RealEarth · Cyclones GDACS</div>
 <div id="loader"><div class="ring"></div></div>
 
 <script type="module">
@@ -592,10 +601,16 @@ float cloudDensL(vec3 p, bool detail, float lod){
   bool cirrus = base > 5.5;
   float prof = cirrus ? smoothstep(0.0, 0.35, h) * (1.0 - smoothstep(0.5, 1.0, h))
                       : smoothstep(0.0, 0.07, h) * (1.0 - smoothstep(0.4, 1.0, h));
-  vec3 q = (p + windOff) / (cirrus ? 48.0 : 20.0);
+  // the detail noise tiles every 20 km: warp it by a ~100 km noise (±18 km) so a big cloud mass seen from
+  // orbit doesn't show the repeat as a regular lattice
+  vec3 wq = textureLod(noise3, p / 97.0 + vec3(0.41, 0.13, 0.77), 2.0).rgb - 0.5;
+  vec3 q = (p + windOff + wq * 36.0) / (cirrus ? 48.0 : 20.0);
   float fade = (1.0 - smoothstep(1.6, 4.2, lod));
   float n = mix(0.62, textureLod(noise3, q, lod).r, fade);
   float dn = remap(n * prof, 1.0 - cov * 0.96, 1.0, 0.0, 1.0);
+  // seen from far away the detail noise is gone and that threshold turns every 20 km map pixel into a hard
+  // edge: blend toward a density that rises smoothly with cover, so fields have soft, partly see-through edges
+  dn = mix(prof * cov * cov * 0.55, dn, fade);
   if(dn <= 0.0) return 0.0;
   if(detail && lod < 3.2){
     float e = mix(0.55, textureLod(noise3, q * 4.3 + 0.37, lod + 2.1).g, (1.0 - smoothstep(0.6, 3.2, lod)));
@@ -603,7 +618,9 @@ float cloudDensL(vec3 p, bool detail, float lod){
   }
   // cellular thinning (~5-10 km cells, inverted Worley): even a 100% deck shows the lighter gaps and darker
   // cells of a real stratocumulus base instead of a flat grey sheet
-  if(!cirrus) dn *= mix(0.45, 1.0, smoothstep(0.25, 0.75, textureLod(noise3, p / 9.0 + vec3(0.2, 0.8, 0.4), max(lod - 1.0, 0.0)).b));
+  // only for views from within/below the layer: its 9 km texture period would tile visibly from orbit
+  float cellW = 1.0 - smoothstep(12.0, 30.0, length(cameraPosition) * RE - RE);
+  if(!cirrus && cellW > 0.0) dn *= mix(1.0, mix(0.45, 1.0, smoothstep(0.25, 0.75, textureLod(noise3, p / 9.0 + vec3(0.2, 0.8, 0.4), max(lod - 1.0, 0.0)).b)), cellW);
   return clamp(dn, 0.0, 1.0) * (cirrus ? 0.09 : 1.0);
 }
 float cloudDens(vec3 p, bool detail){ return cloudDensL(p, detail, 0.0); }
@@ -1398,6 +1415,62 @@ function irTemp(r, g, b) {
   const t = irExact.get((r << 16) | (g << 8) | b);
   return t !== undefined ? t : irLut[((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)];
 }
+// The colormap reuses grey shades: a -70..-80 C band of storm tops (greys 230 -> 5) sits inside the grey scale
+// used for warm ground and low cloud (197 -> 2 = -19..+57 C). NASA's WMS also resamples, blending in-between
+// shades, so per-pixel decoding turned the cores of hurricanes and thunderstorms into warm, clear holes.
+// Each connected patch of grey is judged by what borders it: a storm's cold grey band is enclosed by that
+// storm's dark reds (-60..-70) and pinks/white (< -80); warm ground and low cloud border the blues and greens
+// of mid-level cloud. Patches bordered mostly by cold colours, and storm-sized, are read as cold.
+const irWarmGrey = new Float32Array(256), irColdGrey = new Float32Array(256);
+{
+  const warm = [], cold = [];
+  for (let i = 0; i < IR_TABLE.length; i += 4) {
+    if (IR_TABLE[i] !== IR_TABLE[i + 1] || IR_TABLE[i] !== IR_TABLE[i + 2]) continue;
+    (IR_TABLE[i + 3] > -40 ? warm : IR_TABLE[i + 3] > -85 ? cold : []).push([IR_TABLE[i], IR_TABLE[i + 3]]);
+  }
+  cold.sort((a, b) => a[0] - b[0]);
+  for (let v = 0; v < 256; v++) {
+    let bw = 1e9; for (const [g, T] of warm) { const d = Math.abs(g - v); if (d < bw) { bw = d; irWarmGrey[v] = T; } }
+    // cold band: piecewise-linear between its grey levels (5 -> -70.6 ... 230 -> -79.6), brighter -> colder
+    let T = cold[0][1];
+    for (let k = 0; k + 1 < cold.length; k++) if (v >= cold[k][0] && v <= cold[k + 1][0]) T = cold[k][1] + (cold[k + 1][1] - cold[k][1]) * (v - cold[k][0]) / (cold[k + 1][0] - cold[k][0]);
+    if (v > cold[cold.length - 1][0]) T = cold[cold.length - 1][1] - (v - cold[cold.length - 1][0]) * 0.3;
+    irColdGrey[v] = T;
+  }
+}
+function decodeIR(data) {
+  const n = CMW * CMH, bt = new Float32Array(n).fill(NaN), grey = new Uint8Array(n);
+  for (let k = 0; k < n; k++) {
+    const i = k * 4;
+    if (data[i + 3] < 128) continue;
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    if (Math.abs(r - g) <= 3 && Math.abs(g - b) <= 3 && r <= 232) { grey[k] = 1; bt[k] = irWarmGrey[r]; }
+    else bt[k] = irTemp(r, g, b);
+  }
+  // label 4-connected grey patches and count cold vs warm coloured pixels along their borders
+  const comp = new Int32Array(n).fill(-1), stack = new Int32Array(n), members = [];
+  for (let s0 = 0; s0 < n; s0++) {
+    if (!grey[s0] || comp[s0] >= 0) continue;
+    const id = members.length;
+    let sp = 0, size = 0, cold = 0, warm = 0;
+    stack[sp++] = s0; comp[s0] = id;
+    const list = [];
+    while (sp) {
+      const k = stack[--sp]; size++; if (size <= 60000) list.push(k);
+      const x = k % CMW, y = (k - x) / CMW;
+      const nb = [y * CMW + (x + 1) % CMW, y * CMW + (x - 1 + CMW) % CMW, y > 0 ? k - CMW : -1, y < CMH - 1 ? k + CMW : -1];
+      for (const j of nb) {
+        if (j < 0) continue;
+        if (grey[j]) { if (comp[j] < 0) { comp[j] = id; stack[sp++] = j; } }
+        else if (bt[j] < -55) cold++;
+        else if (bt[j] > -45) warm++;
+      }
+    }
+    members.push(cold > 1.5 * warm && size <= 60000 ? list : null);
+  }
+  for (const list of members) if (list) for (const k of list) bt[k] = irColdGrey[data[k * 4]];
+  return bt;
+}
 const GEO_SATS = [
   { id: 'GOES-East_ABI_Band13_Clean_Infrared', name: 'GOES-East', lon: -75.2 },
   { id: 'GOES-West_ABI_Band13_Clean_Infrared', name: 'GOES-West', lon: -137.2 },
@@ -1423,7 +1496,7 @@ async function fetchGeoIR(sat) {
     irCtx.drawImage(im, 0, 0, CMW, CMH);
     const data = irCtx.getImageData(0, 0, CMW, CMH).data;
     let n = 0; for (let i = 3; i < data.length; i += 4 * 97) if (data[i] > 128) n++;
-    if (n > (data.length / (4 * 97)) * 0.04) return { ...sat, data: new Uint8ClampedArray(data), time: t.getTime() };
+    if (n > (data.length / (4 * 97)) * 0.04) return { ...sat, data: new Uint8ClampedArray(data), bt: decodeIR(data), time: t.getTime() };
   }
   return null;
 }
@@ -1469,7 +1542,7 @@ async function buildCloudMap(sats) {
       }
       let cov = 0, top = 0, base = 0, src = 0;
       if (best) {
-        const bt = irTemp(best.data[i], best.data[i + 1], best.data[i + 2]);
+        const bt = best.bt[i >> 2];
         const ts = grid.ok ? gridSample(grid.temp, lat, lon) : 27 - 0.42 * Math.abs(lat);
         const dT = ts - bt;
         cov = smooth(4.5, 14, dT) * (0.55 + 0.45 * smooth(8, 42, dT));
@@ -1665,7 +1738,7 @@ function buildPrecip() {
   dropGeo.setDrawRange(0, c * 2);
 }
 
-/* ---------- lightning inside live thunderstorm cells ---------- */
+/* ---------- lightning bolts (fired only at real GOES GLM flashes, see below) ---------- */
 let storms = [];
 const bolts = [];
 const flashTex = radialTex([[0, 'rgba(255,255,255,1)'], [0.2, 'rgba(210,225,255,.9)'], [1, 'rgba(150,170,255,0)']]);
@@ -1684,16 +1757,20 @@ function fireBolt(dt) {
   for (const b of bolts) {
     if (b.life > 0) { b.life -= dt; const a = Math.max(b.life / 0.18, 0); b.line.material.opacity = a; b.spr.material.opacity = a; if (b.life <= 0) b.line.visible = b.spr.visible = false; }
   }
-  if (!storms.length || !layers.rain) return;
-  if (Math.random() > dt * Math.min(storms.length, 8) * 1.4) return;
-  const b = bolts.find(x => x.life <= 0); if (!b) return;
-  // prefer the coldest (deepest) satellite-observed tops near a reported thunderstorm
-  const s = storms[Math.floor(Math.random() * storms.length)];
-  let lat = s.lat, lon = s.lon, bestTop = -1;
-  for (let k = 0; k < 12; k++) {
-    const la = s.lat + (Math.random() - 0.5) * 8, lo = s.lon + (Math.random() - 0.5) * 8 / Math.max(Math.cos(s.lat * DEG), 0.2);
-    const c = cloudAt(la, lo); if (c.cov > 0.3 && c.top > bestTop) { bestTop = c.top; lat = la; lon = lo; }
+  if (!layers.lightning || !glm.n || cam.alt > 0.05) return;
+  // forked bolts only where GOES has actually observed lightning, within ~300 km of the view
+  const now = performance.now();
+  if (!fireBolt.near || now - fireBolt.at > 4000) {
+    const f = focusLatLon(), near = [], cl = Math.cos(f.lat * DEG);
+    for (let k = 0; k < glm.n; k++) if (Math.abs(glm.lat[k] - f.lat) < 2.7 && Math.abs(wrapLon(glm.lon[k] - f.lon)) * cl < 2.7) near.push(k);
+    fireBolt.near = near; fireBolt.at = now;
   }
+  const near = fireBolt.near;
+  if (!near.length || Math.random() > dt * Math.min(near.length * 0.06, 6)) return;
+  const b = bolts.find(x => x.life <= 0); if (!b) return;
+  const k = near[Math.floor(Math.random() * near.length)];
+  const lat = glm.lat[k] + (Math.random() - 0.5) * 0.04, lon = glm.lon[k] + (Math.random() - 0.5) * 0.04;
+  const bestTop = cloudAt(lat, lon).top;
   const n = ll2v(lat, lon, 1), e = new THREE.Vector3(n.z, 0, -n.x).normalize(), no = new THREE.Vector3().crossVectors(n, e);
   const arr = b.line.geometry.attributes.position.array, top = 1 + clamp(bestTop, 5, 12) * 0.6 * KM, bot = surfaceR(lat, lon);
   let ox = 0, oy = 0;
@@ -1707,6 +1784,215 @@ function fireBolt(dt) {
   b.spr.position.copy(n).multiplyScalar(top);
   b.spr.scale.setScalar(0.0012 + Math.random() * 0.0015);
   b.life = 0.18; b.line.visible = b.spr.visible = true;
+}
+
+/* ---------- real lightning: NOAA GOES-East GLM group points (Americas + Atlantic) via SSEC RealEarth ---------- */
+const MAX_GLM = 30000;
+const glm = { n: 0, time: 0, lat: new Float32Array(MAX_GLM), lon: new Float32Array(MAX_GLM), okAt: 0 };
+const glmGeo = new THREE.BufferGeometry();
+glmGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(MAX_GLM * 3), 3));
+glmGeo.setAttribute('aPhase', new THREE.BufferAttribute(new Float32Array(MAX_GLM), 1));
+glmGeo.setDrawRange(0, 0);
+const glmU = { time: U.time, uPx: { value: 800 } };
+const glmPts = new THREE.Points(glmGeo, new THREE.ShaderMaterial({
+  uniforms: glmU,
+  vertexShader: /* glsl */`
+    attribute float aPhase; uniform float time, uPx; varying float vA;
+    void main(){
+      vec4 mv = modelViewMatrix * vec4(position, 1.0);
+      // each observed lightning group flashes briefly every few seconds, like the storm it came from
+      float f = fract(time * 0.35 + aPhase);
+      vA = (1.0 - smoothstep(0.0, 0.035, f)) + 0.12 * (1.0 - smoothstep(0.035, 0.09, f));
+      gl_PointSize = clamp(12.0 / 6371.0 / max(-mv.z, 1e-6) * uPx, 2.5, 56.0) * (0.6 + 0.4 * vA);
+      gl_Position = projectionMatrix * mv;
+    }`,
+  fragmentShader: /* glsl */`
+    varying float vA;
+    void main(){
+      float d = length(gl_PointCoord - 0.5) * 2.0;
+      if(d > 1.0 || vA < 0.01) discard;
+      // white-hot core inside an electric blue-violet halo: glows on the night side, and still reads against
+      // bright daylit cloud tops where pure added light would vanish into the white
+      float core = exp(-d * d * 18.0), halo = exp(-d * d * 3.0);
+      float a = clamp((halo * 0.75 + core) * vA, 0.0, 1.0);
+      vec3 col = mix(vec3(0.45, 0.5, 1.0), vec3(1.0), clamp(core * 1.4, 0.0, 1.0));
+      gl_FragColor = vec4(col * a, a);
+    }`,
+  transparent: true, depthWrite: false, blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor
+}));
+glmPts.frustumCulled = false; glmPts.renderOrder = 6;
+scene.add(glmPts);
+async function pollLightning() {
+  if (!layers.lightning) return;
+  try {
+    const d = await fetchJSON('https://realearth.ssec.wisc.edu/api/shapes?products=glmgrouppoints', 30000);
+    const pos = glmGeo.attributes.position.array, ph = glmGeo.attributes.aPhase.array, v = new THREE.Vector3();
+    let n = 0, t = 0;
+    for (const f of d.features || []) {
+      const c = f.geometry && f.geometry.coordinates; if (!c || n >= MAX_GLM) continue;
+      const lat = c[1], lon = c[0]; if (!isFinite(lat) || !isFinite(lon)) continue;
+      glm.lat[n] = lat; glm.lon[n] = lon;
+      ll2v(lat, lon, 1 + 8 * KM, v);             // flashes light the cloud from within, near the tops
+      pos[n * 3] = v.x; pos[n * 3 + 1] = v.y; pos[n * 3 + 2] = v.z;
+      ph[n] = Math.random(); n++;
+      const p = f.properties || {};
+      if (p.RE_PRODUCT_DATE && p.RE_PRODUCT_TIME && !t) {
+        const s = String(p.RE_PRODUCT_DATE) + String(p.RE_PRODUCT_TIME).padStart(6, '0');
+        t = Date.UTC(+s.slice(0, 4), +s.slice(4, 6) - 1, +s.slice(6, 8), +s.slice(8, 10), +s.slice(10, 12), +s.slice(12, 14));
+      }
+    }
+    glm.n = n; glm.time = t || Date.now(); glm.okAt = Date.now();
+    glmGeo.attributes.position.needsUpdate = true; glmGeo.attributes.aPhase.needsUpdate = true;
+    glmGeo.setDrawRange(0, n);
+    setStatus('Lit', 'ok', `${n.toLocaleString()} flashes · ${hhmm(new Date(glm.time))} UTC`);
+  } catch (e) {
+    if (!glm.okAt) setTimeout(pollLightning, 20000);   // first load failed: try again soon rather than in 2 min
+    if (Date.now() - glm.okAt > 10 * 60000) { setStatus('Lit', glm.okAt ? 'err' : 'load', glm.okAt ? 'Unavailable' : 'Retrying'); glm.n = 0; glmGeo.setDrawRange(0, 0); }
+    else setStatus('Lit', 'load', `${glm.n.toLocaleString()} flashes · retrying`);
+    $('#sLit').title = String(e && e.message || e);
+  }
+}
+
+/* ---------- tropical cyclones: GDACS (UN/EC) global feed ---------- */
+const cyclones = [];
+let cycSel = null;
+const vortexTex = (() => {
+  const S = 256, c = document.createElement('canvas'); c.width = c.height = S;
+  const x = c.getContext('2d'); x.translate(S / 2, S / 2);
+  for (let arm = 0; arm < 3; arm++) {
+    x.beginPath();
+    for (let t = 0; t <= 1; t += 0.01) {
+      const a = arm * 2.094 + t * 4.2, r = 10 + t * 112;
+      const px = Math.cos(a) * r, py = Math.sin(a) * r;
+      t ? x.lineTo(px, py) : x.moveTo(px, py);
+    }
+    const g = x.createRadialGradient(0, 0, 8, 0, 0, 124);
+    g.addColorStop(0, 'rgba(255,255,255,0.95)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+    x.strokeStyle = g; x.lineWidth = 7; x.lineCap = 'round'; x.stroke();
+  }
+  x.beginPath(); x.arc(0, 0, 7, 0, Math.PI * 2); x.strokeStyle = 'rgba(255,255,255,.95)'; x.lineWidth = 3; x.stroke();
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.NoColorSpace; return t;
+})();
+const cycGroup = new THREE.Group(); scene.add(cycGroup);
+const cycTrack = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineDashedMaterial({ color: 0xffb35c, dashSize: 0.004, gapSize: 0.003, transparent: true, opacity: 0.9, depthWrite: false }));
+cycTrack.frustumCulled = false; cycTrack.visible = false; cycTrack.renderOrder = 7; scene.add(cycTrack);
+function cycBasinWord(lat, lon) {
+  if (lon >= 100 && lat >= 0) return 'Typhoon';
+  if (lon > -180 && lon < -20 && lat >= 0) return 'Hurricane';
+  if (lon >= 160 || lon <= -140) return lat >= 0 ? 'Hurricane' : 'Cyclone';
+  return 'Cyclone';
+}
+function cycClass(c) {                              // from the latest track label when known, else the lifetime peak
+  const lab = c.label || (c.peak >= 119 ? 'HU' : c.peak >= 63 ? 'TS' : 'TD');
+  return lab === 'TD' ? 'Tropical depression' : lab === 'TS' ? 'Tropical storm' : cycBasinWord(c.lat, c.lon);
+}
+async function loadCyclones() {
+  if (!layers.cyclones) return;
+  try {
+    const d = await fetchJSON('https://www.gdacs.org/gdacsapi/api/events/geteventlist/SEARCH?eventlist=TC&alertlevel=Green;Orange;Red', 30000);
+    const now = Date.now(), out = [];
+    for (const f of d.features || []) {
+      const p = f.properties || {}, c = f.geometry && f.geometry.coordinates;
+      if (!c || !(p.iscurrent === true || p.iscurrent === 'true')) continue;
+      const to = Date.parse(String(p.todate) + 'Z');
+      if (!(now - to < 36 * 3600e3)) continue;      // GDACS keeps an event "current" a while after its last advisory
+      const old = cyclones.find(o => o.id === p.eventid);
+      out.push({
+        id: p.eventid, ep: p.episodeid, name: String(p.eventname || 'Cyclone').replace(/-\d+$/, ''),
+        lat: c[1], lon: c[0], peak: (p.severitydata && p.severitydata.severity) || 0, alert: p.alertlevel || '',
+        from: p.fromdate, to: p.todate, countries: (p.affectedcountries || []).map(a => a.countryname).filter(Boolean).join(', '),
+        report: p.url && p.url.report, geom: p.url && p.url.geometry, track: old ? old.track : null, label: old ? old.label : null
+      });
+    }
+    out.sort((a, b) => b.peak - a.peak);
+    cyclones.splice(0, cyclones.length, ...out);
+    rebuildCycMarkers();
+    setStatus('Cyc', 'ok', cyclones.length ? `${cyclones.length} active · ${cyclones.slice(0, 3).map(c => c.name).join(', ')}` : 'None active');
+  } catch (e) { setStatus('Cyc', cyclones.length ? 'ok' : 'err', cyclones.length ? `${cyclones.length} active · retrying` : 'Unavailable'); $('#sCyc').title = String(e && e.message || e); if (!cyclones.length) setTimeout(loadCyclones, 30000); }
+}
+function rebuildCycMarkers() {
+  for (const c of cycGroup.children) c.material.dispose();
+  cycGroup.clear();
+  for (const el of [...labelsEl.querySelectorAll('.cyc')]) el.remove();
+  for (const c of cyclones) {
+    const spr = new THREE.Sprite(new THREE.SpriteMaterial({ map: vortexTex, transparent: true, depthWrite: false, opacity: 0.85,
+      color: c.peak >= 178 ? 0xff8a7a : c.peak >= 119 ? 0xffc27a : 0xffffff }));
+    spr.position.copy(ll2v(c.lat, c.lon, 1 + 17 * KM));
+    spr.renderOrder = 7; spr.userData.cyc = c;
+    cycGroup.add(spr); c.spr = spr;
+    const el = document.createElement('div'); el.className = 'cyc';
+    el.innerHTML = `<b>${esc(c.name)}</b><span>${esc(cycClass(c))}</span>`;
+    el.addEventListener('click', ev => { ev.stopPropagation(); showCycloneCard(c); });
+    labelsEl.appendChild(el); c.el = el;
+  }
+}
+function updateCyclones(dt, alt) {
+  const show = layers.cyclones && cyclones.length > 0;
+  cycGroup.visible = show;
+  for (const c of cyclones) {
+    if (!c.spr) continue;
+    // a world-scale marker (~900 km across) that fades once the real satellite spiral fills the view
+    const s = 0.14 * clamp(alt / 0.35, 0.35, 1.4);
+    c.spr.scale.set(s, s, 1);
+    c.spr.material.rotation += dt * (c.lat >= 0 ? 0.35 : -0.35);    // counter-clockwise in the north, clockwise in the south
+    c.spr.material.opacity = 0.85 * smooth(0.15, 0.7, alt);        // a guide on the globe; the real spiral takes over closer in
+    let vis = show;
+    if (vis) { const p = screenOf(c.spr.position); vis = !!p && !occluded(c.spr.position); if (vis) c.el.style.transform = `translate(${p[0].toFixed(1)}px,${(p[1] + 14).toFixed(1)}px) translate(-50%,0)`; }
+    c.el.style.display = vis ? 'flex' : 'none';
+  }
+  if (cycTrack.visible && (!show || !cycSel)) cycTrack.visible = false;
+}
+async function cycloneTrack(c) {
+  if (c.track) return c.track;
+  const d = await fetchJSON(c.geom, 45000);
+  const segs = [];
+  for (const f of d.features || []) {
+    const g = f.geometry; if (!g || g.type !== 'LineString' || !/^Line_Line/.test((f.properties || {}).Class || '')) continue;
+    segs.push({ a: g.coordinates[0], b: g.coordinates[g.coordinates.length - 1], label: (f.properties || {}).polygonlabel });
+  }
+  // chain the segments into one path and find the one that ends at the current centre (its label = latest class)
+  const key = p => p[0].toFixed(2) + ',' + p[1].toFixed(2);
+  const next = new Map(), hasPrev = new Set();
+  for (const s of segs) { next.set(key(s.a), s); hasPrev.add(key(s.b)); }
+  let start = segs.find(s => !hasPrev.has(key(s.a))) || segs[0];
+  const path = []; const seen = new Set();
+  for (let s = start; s && !seen.has(s); s = next.get(key(s.b))) { seen.add(s); if (!path.length) path.push(s.a); path.push(s.b); }
+  const here = segs.find(s => Math.abs(s.b[0] - c.lon) < 0.05 && Math.abs(s.b[1] - c.lat) < 0.05);
+  if (here && here.label) c.label = here.label;
+  c.track = path;
+  return path;
+}
+function drawCycTrack(c) {
+  if (!c.track || c.track.length < 2) { cycTrack.visible = false; return; }
+  const pts = [], v = new THREE.Vector3();
+  for (let i = 0; i + 1 < c.track.length; i++) {
+    const [lo0, la0] = c.track[i], [lo1, la1] = c.track[i + 1];
+    for (let k = 0; k < 8; k++) { ll2v(lerp(la0, la1, k / 8), lerp(lo0, lo1, k / 8), 1 + 18 * KM, v); pts.push(v.x, v.y, v.z); }
+  }
+  const [lo, la] = c.track[c.track.length - 1]; ll2v(la, lo, 1 + 18 * KM, v); pts.push(v.x, v.y, v.z);
+  cycTrack.geometry.dispose();
+  cycTrack.geometry = new THREE.BufferGeometry(); cycTrack.geometry.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+  cycTrack.computeLineDistances(); cycTrack.visible = true;
+}
+function renderCycloneCard(c) {
+  const fmtD = s => { const d = new Date(String(s) + 'Z'); return isNaN(d) ? '' : d.toUTCString().slice(5, 22) + ' UTC'; };
+  const alertCol = c.alert === 'Red' ? '#ff6b6b' : c.alert === 'Orange' ? '#ffb35c' : '#7ddc8a';
+  card.innerHTML = X + `
+    <div class="k">${esc(cycClass(c))}${c.label ? '' : ' (from peak intensity)'} · <span style="color:${alertCol}">GDACS ${esc(c.alert || '')} alert</span></div>
+    <div class="h">${esc(c.name)}</div>
+    <div class="big">${Math.round(c.peak)}<small>km/h peak sustained wind · ${Math.round(c.peak / 1.852)} kt</small></div>
+    <div class="stats"><span>Centre <b>${fmtLat(c.lat)} ${fmtLon(c.lon)}</b></span>${c.countries ? `<span>Affecting <b>${esc(c.countries)}</b></span>` : ''}</div>
+    <div class="meta"><span>Active since ${fmtD(c.from)} · last advisory ${fmtD(c.to)}</span></div>
+    <div class="meta"><span>${c.track ? 'Dashed line: observed and forecast track' : 'Loading track…'} · clouds are the live satellite view</span></div>
+    <div class="meta"><button onclick="window.__flyTo(${c.lat},${c.lon},0.25)">Fly here</button>${c.report ? `<a href="${esc(c.report)}" target="_blank" rel="noopener">GDACS report ↗</a>` : ''}</div>`;
+}
+async function showCycloneCard(c) {
+  pinLL = null; pin.visible = false; cycSel = c;
+  openCard('cyc', '', c); renderCycloneCard(c);
+  try { await cycloneTrack(c); } catch (e) { c.track = null; }
+  if (cardObj !== c) return;
+  drawCycTrack(c); renderCycloneCard(c);
+  if (c.el) c.el.querySelector('span').textContent = cycClass(c);
 }
 
 /* ---------- wind flow particles (live 10 m wind) ---------- */
@@ -3402,6 +3688,13 @@ function nextPlane() {
   setMode('plane', false, true);
 }
 function chaseStorm() {
+  if (layers.cyclones && cyclones.length) {
+    const c = cyclones[0];                       // strongest active tropical cyclone (GDACS)
+    flyTo(c.lat, c.lon, 0.25, 3);
+    document.querySelectorAll('#modes button').forEach(b => b.classList.toggle('on', b.dataset.m === 'storm'));
+    setTimeout(() => { showCycloneCard(c); document.querySelectorAll('#modes button').forEach(b => b.classList.toggle('on', b.dataset.m === mode)); }, 3200);
+    return;
+  }
   if (!grid.ok) { toast('Weather still loading…'); return; }
   // the coldest (tallest) satellite-observed cloud tops near reported thunderstorms or heavy rain
   let best = null, bs = -1;
@@ -3434,7 +3727,7 @@ document.querySelectorAll('#modes button').forEach(b => b.addEventListener('clic
    ===================================================================== */
 const card = $('#card');
 let cardKind = null, cardObj = null;
-function hideCard() { card.style.display = 'none'; cardKind = null; cardObj = null; pin.visible = false; if (selectedSat) { selectedSat = null; orbitLine.visible = false; } }
+function hideCard() { card.style.display = 'none'; cardKind = null; cardObj = null; pin.visible = false; cycSel = null; cycTrack.visible = false; if (selectedSat) { selectedSat = null; orbitLine.visible = false; } }
 const pin = new THREE.Mesh(new THREE.ConeGeometry(0.5, 1.6, 12), new THREE.MeshStandardMaterial({ color: 0x7cc4ff, emissive: 0x16304a, roughness: 0.5 }));
 pin.geometry.rotateX(Math.PI); pin.geometry.translate(0, 0.8, 0); pin.visible = false;
 scene.add(pin);
@@ -3631,7 +3924,7 @@ async function showBuildingCard(b) {
 /* =====================================================================
    UI: layers, search, settings, clock
    ===================================================================== */
-const layers = { clouds: true, radar: true, rain: true, wind: false, temp: false, buildings: true, roads: true, landmarks: true, labels: true, lights: true, flights: true, trails: true, ships: true, trains: true, roadTraffic: true, sats: true, starlink: false, iss: true };
+const layers = { clouds: true, radar: true, rain: true, lightning: true, cyclones: true, wind: false, temp: false, buildings: true, roads: true, landmarks: true, labels: true, lights: true, flights: true, trails: true, ships: true, trains: true, roadTraffic: true, sats: true, starlink: false, iss: true };
 function applyLayers() {
   cloudShell.visible = layers.clouds;
   surfU.showRadar.value = layers.radar ? 1 : 0; surfU.showTemp.value = layers.temp ? 1 : 0; surfU.showLights.value = layers.lights ? 1 : 0;
@@ -3642,6 +3935,10 @@ function applyLayers() {
   iss.visible = layers.iss && !!issNow;
   satPoints.visible = layers.sats; starPoints.visible = layers.starlink;
   if (layers.starlink) loadStarlink();
+  glmPts.visible = layers.lightning; cycGroup.visible = layers.cyclones;
+  if (layers.lightning && !glm.n) pollLightning();
+  if (layers.cyclones && !cyclones.length) loadCyclones();
+  if (!layers.cyclones) { for (const c of cyclones) if (c.el) c.el.style.display = 'none'; cycTrack.visible = false; }
   if (layers.ships && !shipArr.length) pollShips();
   if (layers.trains && !trainArr.length) pollTrains();
   if (layers.roadTraffic && !nycLinks.length) pollNYC();
@@ -3814,6 +4111,7 @@ function frame() {
   updateMapData(now, alt, focus);
   updateFlights();
   updateSurfaceTraffic(alt);
+  glmU.uPx.value = pxScale; updateCyclones(dt, alt);
   updateSatellites();
   updateISS();
   updateWind(dt);
@@ -3832,7 +4130,7 @@ function frame() {
 /* =====================================================================
    BOOT
    ===================================================================== */
-if (/[?&]debug\b/.test(location.search)) window.__mw = { flyTo, cam, camera, tiles, wikiNear, cloudAt, get shipArr() { return shipArr; }, get trainArr() { return trainArr; }, get nycLinks() { return nycLinks; }, showShipCard, showTrainCard, showNYCCard, get alt() { return camera.position.length() - 1; } };
+if (/[?&]debug\b/.test(location.search)) window.__mw = { flyTo, cam, camera, tiles, wikiNear, cloudAt, decodeIR, irTemp, glm, get shipArr() { return shipArr; }, get trainArr() { return trainArr; }, get nycLinks() { return nycLinks; }, showShipCard, showTrainCard, showNYCCard, get alt() { return camera.position.length() - 1; } };
 (async function boot() {
   const [day, night, topo, water] = await Promise.all([
     loadTex('earth-blue-marble.jpg', solidTex(18, 52, 96)), loadTex('earth-night.jpg', solidTex(0, 0, 0)),
@@ -3853,6 +4151,8 @@ if (/[?&]debug\b/.test(location.search)) window.__mw = { flyTo, cam, camera, til
   setInterval(() => loadRadar(), 10 * 60 * 1000);
   setInterval(() => loadClouds(), 15 * 60 * 1000);
   setInterval(() => pollShips(), 60 * 1000);
+  setInterval(() => pollLightning(), 2 * 60 * 1000);
+  setInterval(() => loadCyclones(), 30 * 60 * 1000);
   setInterval(() => pollTrains(), 15 * 1000);
   setInterval(() => pollNYC(), 5 * 60 * 1000);
   setInterval(() => { if (nycAsOf) nycStatus(); }, 60 * 1000);
