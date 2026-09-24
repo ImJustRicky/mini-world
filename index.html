@@ -665,6 +665,7 @@ const GLSL_SURFACE = GLSL_COMMON + /* glsl */`
 uniform sampler2D nightMap, waterMap, radarMap;
 uniform float showRadar, showTemp, showLights, cloudShadow;
 vec3 shadeSurface(vec3 alb, vec3 P, vec3 bn, float water, float lum, vec2 uvG, float reliefW){
+  alb = max(alb, 0.0);
   vec3 n = normalize(P);
   vec3 e = eastOf(n); vec3 no = cross(n, e);
   vec3 V = normalize(cameraPosition - P);
@@ -689,7 +690,7 @@ vec3 shadeSurface(vec3 alb, vec3 P, vec3 bn, float water, float lum, vec2 uvG, f
     if(near > 0.0){ rx += snoise(n * 240000.0 + vec3(time*2.1, time*1.7, -time*1.3)) * near; ry += snoise(n * 240000.0 + vec3(-time*1.9, 9.0, time*1.5)) * near; }
     if(rx != rx || ry != ry){ rx = 0.0; ry = 0.0; }
     vec3 wn = normalize(n + 0.05 * (e * rx + no * ry));
-    float fres = 0.02 + 0.98 * pow(1.0 - max(dot(wn, V), 0.0), 5.0);
+    float fres = 0.02 + 0.98 * pow(clamp(1.0 - dot(wn, V), 0.0, 1.0), 5.0);
     vec3 skyC = skyAmbient(ndl) * 2.4;
     vec3 R = reflect(-V, wn);
     float glint = sunGlint(R, camDist);
@@ -860,7 +861,9 @@ const TILE_FS = GLSL_SURFACE + /* glsl */`
     vec4 tile = texture2D(map, vUv);                 // rgb = imagery, a = water mask from the elevation data
     vec3 day = tile.rgb;
     float lum = dot(day, vec3(0.299,0.587,0.114));
-    day = mix(vec3(lum), day, 1.12);
+    // saturation boost can push a zero channel (deep-ocean red is often exactly 0) below zero, and pow() of a
+    // negative is undefined in GLSL: many GPUs return NaN, which painted the oceans red/pink — clamp first
+    day = max(mix(vec3(lum), day, 1.12), 0.0);
     day = pow(day, vec3(1.05));
     float wm = texture2D(waterMap, vUvG).r;
     float water = hasDem > 0.5 ? smoothstep(0.3, 0.7, tile.a) * smoothstep(0.05, 0.3, wm) : smoothstep(0.45, 0.65, wm);
@@ -1140,7 +1143,7 @@ const cloudMat = new THREE.ShaderMaterial({
   fragmentShader: GLSL_COMMON + /* glsl */`
     uniform float opacity, steps;
     varying vec3 vPos;
-    float hg(float c, float g){ float g2 = g*g; return (1.0 - g2) / (4.0*PI*pow(1.0 + g2 - 2.0*g*c, 1.5)); }
+    float hg(float c, float g){ float g2 = g*g; return (1.0 - g2) / (4.0*PI*pow(max(1.0 + g2 - 2.0*g*c, 1e-4), 1.5)); }
     void main(){
       vec3 ro = cameraPosition * RE;
       vec3 rd = normalize(vPos - cameraPosition);
@@ -1900,7 +1903,7 @@ const buildMat = new THREE.ShaderMaterial({
       }
       vec3 col = base * (Ts * 1.2 * diff * (1.0 - 0.8 * sh) + amb + Ts * max(ndl, 0.0) * sh * 0.42 * (0.7 + 0.3 * up));
       vec3 V = normalize(cameraPosition - vW);
-      float fres = pow(1.0 - max(dot(N, V), 0.0), 4.0);
+      float fres = pow(clamp(1.0 - dot(N, V), 0.0, 1.0), 4.0);
       col += win * (0.04 + fres * 0.5) * skyAmbient(ndl) * 2.5;             // glass reflects the sky
       vec3 Rf = reflect(-V, N);
       col += win * Ts * pow(max(dot(Rf, sunDir), 0.0), 200.0) * 2.0 * (1.0 - sh);
@@ -2041,7 +2044,7 @@ const roadMat = new THREE.ShaderMaterial({
       vec3 col = base * (Ts * 1.15 * max(ndl, 0.0) * (1.0 - 0.8 * sh) + skyAmbient(ndl) + Ts * max(ndl, 0.0) * sh * 0.42);
       // sodium / LED street lighting after dark: pools of light every ~30 m
       float nightF = 1.0 - smoothstep(-0.12, 0.04, ndl);
-      float pool = 0.35 + 0.65 * pow(0.5 + 0.5 * cos(vF.x / 30.0 * 6.2832), 3.0);
+      float pool = 0.35 + 0.65 * pow(max(0.5 + 0.5 * cos(vF.x / 30.0 * 6.2832), 0.0), 3.0);
       col += vF.w * nightF * vec3(1.0, 0.72, 0.38) * 0.32 * pool * (1.0 - 0.5 * abs(vF.y));
       vec3 V = normalize(cameraPosition - vW);
       vec3 L, T;
