@@ -1156,7 +1156,7 @@ function makeNoise3D(S) {
 }
 U.noise3.value = makeNoise3D(64);
 
-const cloudU = { ...U, opacity: { value: 1 }, steps: { value: 56 }, inShell: { value: 0 } };
+const cloudU = { ...U, opacity: { value: 1 }, steps: { value: 56 }, inShell: { value: 0 }, projM: { value: null } };
 const cloudMat = new THREE.ShaderMaterial({
   uniforms: cloudU,
   vertexShader: /* glsl */`
@@ -1171,6 +1171,7 @@ const cloudMat = new THREE.ShaderMaterial({
     }`,
   fragmentShader: GLSL_COMMON + /* glsl */`
     uniform float opacity, steps;
+    uniform mat4 projM;
     varying vec3 vPos;
     float hg(float c, float g){ float g2 = g*g; return (1.0 - g2) / (4.0*PI*pow(max(1.0 + g2 - 2.0*g*c, 1e-4), 1.5)); }
     void main(){
@@ -1249,10 +1250,15 @@ const cloudMat = new THREE.ShaderMaterial({
       atmo(ro, rd, max(tHit, t0), La, Ta);
       vec3 col = L * Ta + skyTone(La * HAZE) * (1.0 - T);
       gl_FragColor = vec4(shoulder(col) * opacity, alpha);
+      // depth of where the cloud begins along this ray: aircraft and buildings in front of it now hide it,
+      // and anything inside or behind it is covered (the shell's own depth says nothing about the cloud)
+      vec4 hc = projM * vec4(mat3(viewMatrix) * (rd * max(tHit, t0) / RE), 1.0);
+      gl_FragDepth = clamp(hc.z / hc.w * 0.5 + 0.5, 0.0, 1.0);
     }`,
   transparent: true, depthWrite: false,
   blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor
 });
+cloudU.projM.value = camera.projectionMatrix;   // updated in place by updateProjectionMatrix()
 const CLOUD_SHELL_R = 1 + (CLOUD_TOP_KM + 0.1) * KM;
 const cloudShell = new THREE.Mesh(new THREE.SphereGeometry(CLOUD_SHELL_R, 160, 80), cloudMat);
 cloudShell.renderOrder = 5; cloudShell.frustumCulled = false;
@@ -2675,27 +2681,184 @@ async function wikiLookup(names, lat, lon, radius) {
 /* =====================================================================
    AIR TRAFFIC (OpenSky global + adsb.lol / adsb.fi regional), true altitudes
    ===================================================================== */
-function planeGeometry() {
-  const parts = [];
-  const fus = new THREE.CylinderGeometry(0.1, 0.07, 1.0, 8); fus.rotateX(Math.PI / 2); parts.push(fus);
-  const nose = new THREE.ConeGeometry(0.1, 0.25, 8); nose.rotateX(Math.PI / 2); nose.translate(0, 0, 0.62); parts.push(nose);
-  const wing = new THREE.BoxGeometry(1.15, 0.035, 0.26); wing.translate(0, -0.02, 0.05); parts.push(wing);
-  const stab = new THREE.BoxGeometry(0.42, 0.03, 0.14); stab.translate(0, 0.0, -0.44); parts.push(stab);
-  const fin = new THREE.BoxGeometry(0.03, 0.26, 0.18); fin.translate(0, 0.14, -0.42); parts.push(fin);
-  const g = mergeGeometries(parts.map(p => p.toNonIndexed()));
+/* ---------- aircraft models: real shapes and real dimensions per ICAO type ---------- */
+// type -> [length m, wingspan m, body class]
+const AC_TYPES = {
+  A318: [31.4, 34.1, 'nb'], A319: [33.8, 35.8, 'nb'], A320: [37.6, 35.8, 'nb'], A321: [44.5, 35.8, 'nb'], A19N: [33.8, 35.8, 'nb'], A20N: [37.6, 35.8, 'nb'], A21N: [44.5, 35.8, 'nb'],
+  B736: [31.2, 34.3, 'nb'], B737: [31.2, 34.3, 'nb'], B738: [39.5, 35.8, 'nb'], B739: [42.1, 35.8, 'nb'], B37M: [35.6, 35.9, 'nb'], B38M: [39.5, 35.9, 'nb'], B39M: [42.2, 35.9, 'nb'], B3XM: [43.8, 35.9, 'nb'],
+  B752: [47.3, 38.1, 'nb'], B753: [54.4, 38.1, 'nb'], BCS1: [35.0, 35.1, 'nb'], BCS3: [38.7, 35.1, 'nb'],
+  E170: [29.9, 26.0, 'nb'], E75L: [31.7, 26.0, 'nb'], E75S: [31.7, 26.0, 'nb'], E190: [36.2, 28.7, 'nb'], E195: [38.7, 28.7, 'nb'], E290: [36.2, 33.7, 'nb'], E295: [41.5, 35.1, 'nb'],
+  A306: [54.1, 44.8, 'wb'], A30B: [53.6, 44.8, 'wb'], A310: [46.7, 43.9, 'wb'], A332: [58.8, 60.3, 'wb'], A333: [63.7, 60.3, 'wb'], A338: [58.8, 64.0, 'wb'], A339: [63.7, 64.0, 'wb'],
+  A359: [66.8, 64.8, 'wb'], A35K: [73.8, 64.8, 'wb'], B762: [48.5, 47.6, 'wb'], B763: [54.9, 47.6, 'wb'], B764: [61.4, 51.9, 'wb'], B772: [63.7, 60.9, 'wb'], B77L: [63.7, 64.8, 'wb'],
+  B77W: [73.9, 64.8, 'wb'], B778: [70.9, 71.8, 'wb'], B779: [76.7, 71.8, 'wb'], B788: [56.7, 60.1, 'wb'], B789: [62.8, 60.1, 'wb'], B78X: [68.3, 60.1, 'wb'], MD11: [61.6, 51.7, 'wb'], DC10: [55.5, 47.3, 'wb'],
+  A388: [72.7, 79.8, 'quad'], B744: [70.7, 64.4, 'quad'], B748: [76.3, 68.4, 'quad'], A343: [63.7, 60.3, 'quad'], A346: [75.3, 63.5, 'quad'], A124: [69.1, 73.3, 'quad'], C17: [53.0, 51.8, 'quad'],
+  CRJ2: [26.8, 21.2, 'rj'], CRJ7: [32.5, 23.2, 'rj'], CRJ9: [36.2, 24.9, 'rj'], CRJX: [39.1, 26.2, 'rj'], E135: [26.3, 20.0, 'rj'], E145: [29.9, 20.0, 'rj'], B712: [37.8, 28.4, 'rj'],
+  MD82: [45.1, 32.9, 'rj'], MD83: [45.1, 32.9, 'rj'], MD88: [45.1, 32.9, 'rj'], MD90: [46.5, 32.9, 'rj'],
+  AT43: [22.7, 24.6, 'tp'], AT45: [22.7, 24.6, 'tp'], AT72: [27.2, 27.1, 'tp'], AT75: [27.2, 27.1, 'tp'], AT76: [27.2, 27.1, 'tp'], DH8A: [22.3, 25.9, 'tp'], DH8C: [25.7, 27.4, 'tp'],
+  DH8D: [32.8, 28.4, 'tp'], SF34: [19.7, 21.4, 'tp'], SB20: [27.3, 24.8, 'tp'], D328: [21.3, 21.0, 'tp'], B350: [14.2, 17.7, 'tp'], BE20: [13.3, 16.6, 'tp'], C130: [29.8, 40.4, 'tp'],
+  C56X: [15.8, 17.2, 'bj'], C68A: [19.4, 22.0, 'bj'], C700: [22.3, 22.0, 'bj'], CL30: [20.9, 19.5, 'bj'], CL35: [20.9, 19.5, 'bj'], CL60: [20.9, 19.6, 'bj'], GLF4: [26.9, 23.7, 'bj'],
+  GLF5: [29.4, 28.5, 'bj'], GLF6: [30.4, 30.4, 'bj'], GL5T: [29.5, 28.7, 'bj'], GLEX: [30.3, 28.7, 'bj'], GL7T: [33.8, 31.7, 'bj'], F2TH: [20.2, 21.4, 'bj'], FA7X: [23.2, 26.2, 'bj'],
+  FA8X: [24.5, 26.3, 'bj'], E55P: [15.6, 15.9, 'bj'], E545: [20.7, 20.0, 'bj'], LJ45: [17.7, 14.6, 'bj'], LJ75: [17.7, 15.5, 'bj'], PC24: [16.9, 17.0, 'bj'], C25A: [14.0, 15.5, 'bj'], C25B: [15.6, 16.3, 'bj'],
+  C172: [8.3, 11.0, 'ga'], C152: [7.3, 10.1, 'ga'], C182: [8.8, 11.0, 'ga'], C206: [8.6, 11.0, 'ga'], C208: [11.5, 15.9, 'ga'], P28A: [7.3, 10.7, 'ga'], SR22: [7.9, 11.7, 'ga'], SR20: [7.9, 11.7, 'ga'],
+  DA40: [8.0, 11.9, 'ga'], DA42: [8.6, 13.4, 'ga'], BE36: [8.4, 10.2, 'ga'], PC12: [14.4, 16.3, 'ga'], TBM9: [10.7, 12.8, 'ga'], M20P: [7.5, 11.0, 'ga'],
+  EC35: [10.2, 10.2, 'heli'], EC45: [11.6, 11.0, 'heli'], EC30: [10.7, 10.7, 'heli'], AS50: [10.9, 10.7, 'heli'], AS65: [13.7, 11.9, 'heli'], R44: [8.9, 10.1, 'heli'], R22: [8.8, 7.7, 'heli'],
+  B06: [9.5, 10.2, 'heli'], B407: [12.7, 10.7, 'heli'], S76: [16.0, 13.4, 'heli'], A139: [16.7, 13.8, 'heli'], H60: [19.8, 16.4, 'heli'], EC55: [16.8, 16.2, 'heli'],
+};
+// ADS-B emitter category fallback: A1 light, A2 small, A3 large, A4 757-class, A5 heavy, A7 rotorcraft
+const AC_CAT = { A1: [8.5, 11, 'ga'], A2: [18, 18, 'bj'], A3: [38, 35, 'nb'], A4: [47, 38, 'nb'], A5: [64, 61, 'wb'], A7: [12, 11, 'heli'] };
+// airline (ICAO callsign prefix) -> [fuselage, tail] colours
+const AC_LIVERY = {
+  UPS: [[0.86, 0.84, 0.8], [0.33, 0.21, 0.13]], FDX: [[0.95, 0.95, 0.96], [0.3, 0.1, 0.5]], DAL: [[0.95, 0.95, 0.97], [0.66, 0.08, 0.15]], AAL: [[0.8, 0.82, 0.86], [0.18, 0.27, 0.55]],
+  UAL: [[0.93, 0.94, 0.96], [0.06, 0.18, 0.45]], SWA: [[0.2, 0.3, 0.62], [0.2, 0.3, 0.62]], JBU: [[0.95, 0.95, 0.97], [0.08, 0.17, 0.42]], ASA: [[0.95, 0.95, 0.97], [0.05, 0.16, 0.3]],
+  NKS: [[0.95, 0.85, 0.1], [0.95, 0.85, 0.1]], FFT: [[0.95, 0.95, 0.97], [0.1, 0.45, 0.25]], ACA: [[0.95, 0.95, 0.97], [0.1, 0.1, 0.1]], WJA: [[0.95, 0.95, 0.97], [0.05, 0.5, 0.55]],
+  AMX: [[0.95, 0.95, 0.97], [0.06, 0.13, 0.35]], VOI: [[0.95, 0.95, 0.97], [0.45, 0.15, 0.5]], RYR: [[0.95, 0.95, 0.97], [0.05, 0.1, 0.35]], EZY: [[0.95, 0.95, 0.97], [1.0, 0.45, 0.05]],
+  BAW: [[0.95, 0.95, 0.97], [0.1, 0.15, 0.4]], DLH: [[0.95, 0.95, 0.97], [0.05, 0.1, 0.3]], AFR: [[0.95, 0.95, 0.97], [0.9, 0.9, 0.95]], KLM: [[0.35, 0.62, 0.86], [0.35, 0.62, 0.86]],
+  UAE: [[0.95, 0.95, 0.97], [0.8, 0.1, 0.12]], QTR: [[0.95, 0.95, 0.97], [0.42, 0.07, 0.2]], THY: [[0.95, 0.95, 0.97], [0.8, 0.1, 0.1]], SIA: [[0.95, 0.95, 0.97], [0.06, 0.12, 0.35]],
+  QFA: [[0.95, 0.95, 0.97], [0.8, 0.1, 0.1]], ANA: [[0.95, 0.95, 0.97], [0.05, 0.25, 0.6]], JAL: [[0.95, 0.95, 0.97], [0.95, 0.95, 0.97]], CPA: [[0.95, 0.95, 0.97], [0.05, 0.3, 0.25]],
+  ETD: [[0.93, 0.9, 0.84], [0.6, 0.5, 0.35]], KAL: [[0.62, 0.78, 0.9], [0.62, 0.78, 0.9]], IBE: [[0.95, 0.95, 0.97], [0.8, 0.1, 0.1]], SAS: [[0.95, 0.95, 0.97], [0.1, 0.15, 0.4]],
+  WZZ: [[0.95, 0.95, 0.97], [0.55, 0.15, 0.45]], VLG: [[0.95, 0.95, 0.97], [0.95, 0.8, 0.1]], TAP: [[0.95, 0.95, 0.97], [0.1, 0.5, 0.25]], LAN: [[0.95, 0.95, 0.97], [0.15, 0.15, 0.45]],
+  GTI: [[0.95, 0.95, 0.97], [0.1, 0.15, 0.4]], ABX: [[0.95, 0.95, 0.97], [0.1, 0.25, 0.55]], CKS: [[0.95, 0.95, 0.97], [0.1, 0.4, 0.3]], CLX: [[0.95, 0.95, 0.97], [0.1, 0.25, 0.5]],
+};
+function acSpec(f) {
+  if (f.ac && f.ac.key === (f.type || '') + '|' + (f.cat || '') + '|' + (f.cs || '')) return f.ac;
+  const t = AC_TYPES[(f.type || '').toUpperCase()] || AC_CAT[f.cat] || [38, 35, 'nb'];
+  const pre = /^[A-Z]{3}\d/.test(f.cs || '') ? f.cs.slice(0, 3) : '';
+  const [body, tail] = AC_LIVERY[pre] || [[0.95, 0.95, 0.97], [0.9, 0.91, 0.93]];
+  f.ac = { key: (f.type || '') + '|' + (f.cat || '') + '|' + (f.cs || ''), len: t[0], span: t[1], cls: t[2], body, tail, known: !!AC_TYPES[(f.type || '').toUpperCase()] };
+  return f.ac;
+}
+// --- geometry: +z forward (nose), +y up, +x right; normalised to length 1 (x/z spans in units of length) ---
+function acParts() { return { pos: [], nor: [], part: [] }; }
+function acAdd(P, g, part) {
+  const n = g.index ? g.toNonIndexed() : g;
+  if (!n.attributes.normal) n.computeVertexNormals();
+  P.pos.push(...n.attributes.position.array); P.nor.push(...n.attributes.normal.array);
+  for (let i = 0; i < n.attributes.position.count; i++) P.part.push(part);
+}
+function acBuild(P) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(P.pos, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(P.nor, 3));
+  g.setAttribute('aPart', new THREE.Float32BufferAttribute(P.part, 1));
+  return g;
+}
+// flat-shaded slab between a root and a tip section, each [x, y, zLE, zTE], with thickness t (vertical slab when vert)
+function acSlab(root, tip, t, vert = false) {
+  const q = [];
+  const sec = (s, sign) => vert
+    ? [[s[0] + sign * t / 2, s[1], s[2]], [s[0] + sign * t / 2, s[1], s[3]]]
+    : [[s[0], s[1] + sign * t / 2, s[2]], [s[0], s[1] + sign * t / 2, s[3]]];
+  const [a0, a1] = sec(root, 1), [b0, b1] = sec(root, -1), [c0, c1] = sec(tip, 1), [d0, d1] = sec(tip, -1);
+  const quad = (p, q2, r, s) => q.push(...p, ...q2, ...r, ...p, ...r, ...s);
+  quad(a0, c0, c1, a1); quad(b0, b1, d1, d0);          // upper / lower (or left / right) skins
+  quad(a0, b0, d0, c0); quad(a1, c1, d1, b1);          // leading / trailing edges
+  quad(c0, d0, d1, c1); quad(a0, a1, b1, b0);          // tip and root caps
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(q, 3)); g.computeVertexNormals();
+  return g;
+}
+function acFuselage(R, noseK = 0.1, tailK = 0.26, upsweep = 0.35, hump = 0) {
+  const pts = [];
+  for (let i = 0; i <= 28; i++) {
+    const z = -0.5 + i / 28;
+    let r = R;
+    if (z > 0.5 - noseK) { const u = (z - (0.5 - noseK)) / noseK; r = R * Math.sqrt(Math.max(1 - u * u, 0)) * (1 - 0.15 * u) + 0.0005; }
+    if (z < -0.5 + tailK) { const u = (-0.5 + tailK - z) / tailK; r = R * (1 - 0.82 * u) + 0.0005; }
+    pts.push(new THREE.Vector2(r, z));
+  }
+  const g = new THREE.LatheGeometry(pts, 18); g.rotateX(Math.PI / 2);
+  const p = g.attributes.position;
+  for (let i = 0; i < p.count; i++) {
+    const z = p.getZ(i), y = p.getY(i);
+    if (z < -0.5 + tailK) p.setY(i, y + (-0.5 + tailK - z) * upsweep * R / tailK * 0.9);   // upswept tail cone
+    if (hump && z > 0.05 && y > 0) p.setY(i, y * (1 + hump * Math.min((z - 0.05) / 0.2, 1) * (1 - Math.max((z - 0.35) / 0.1, 0))));
+  }
   g.computeVertexNormals();
   return g;
 }
-const PLANE_REAL = 45 * TERRAIN_K / 1.25;     // ~45 m airliner, model is 1.25 units long
-const planeMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5, metalness: 0.15 });
-planeMat.onBeforeCompile = sh => {
-  sh.fragmentShader = sh.fragmentShader.replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\n totalEmissiveRadiance = vColor * 0.3;');
+function acNacelle(r, len, x, y, z) { const g = new THREE.CylinderGeometry(r * 0.92, r, len, 12, 1, false); g.rotateX(Math.PI / 2); g.translate(x, y, z); return g; }
+function acDisc(r, x, y, z, axis = 'z') { const g = new THREE.CylinderGeometry(r, r, 0.0015, 20); if (axis === 'z') g.rotateX(Math.PI / 2); g.translate(x, y, z); return g; }
+function acLight(x, y, z) { const g = new THREE.BoxGeometry(0.006, 0.004, 0.006); g.translate(x, y, z); return g; }
+function acJet(o) {
+  // o: R (fuselage radius), span, sweep (deg), rootC, tipC, wingZ, wingY, eng: [[x, y, z, r, len]...], tTail, finH, stabSpan, tailEng
+  const P = acParts(), sw = Math.tan(o.sweep * DEG), dih = Math.tan((o.dihedral ?? 5) * DEG), half = o.span / 2;
+  acAdd(P, acFuselage(o.R, o.noseK, o.tailK, o.upsweep ?? 0.35, o.hump || 0), 0);
+  const wing = s => acSlab([0, o.wingY, o.wingZ + o.rootC / 2, o.wingZ - o.rootC / 2],
+    [s * half, o.wingY + half * dih, o.wingZ + o.rootC / 2 - half * sw, o.wingZ + o.rootC / 2 - half * sw - o.tipC], o.rootC * 0.12);
+  acAdd(P, wing(1), 2); acAdd(P, wing(-1), 2);
+  // vertical fin
+  const finRoot = o.finRoot ?? 0.2, finTip = finRoot * 0.45, fz = -0.5 + (o.tailK ?? 0.26) * 0.55 + finRoot / 2, fy0 = o.R * 0.7 + (o.upsweep ?? 0.35) * o.R * 0.6;
+  const finSw = Math.tan((o.finSweep ?? 40) * DEG) * o.finH;
+  acAdd(P, acSlab([0, fy0, fz, fz - finRoot], [0, fy0 + o.finH, fz - finSw, fz - finSw - finTip], o.R * 0.18, true), 1);
+  // horizontal stabilisers (on top of the fin for T-tails)
+  const sh = o.stabSpan / 2, sRoot = finRoot * 0.75, sz = o.tTail ? fz - finSw - 0.005 : -0.5 + (o.tailK ?? 0.26) * 0.35 + sRoot / 2;
+  const sy = o.tTail ? fy0 + o.finH : o.R * 0.35 + (o.upsweep ?? 0.35) * o.R * 0.5;
+  for (const s of [1, -1]) acAdd(P, acSlab([0, sy, sz, sz - sRoot], [s * sh, sy + sh * 0.08, sz - sh * Math.tan(35 * DEG), sz - sh * Math.tan(35 * DEG) - sRoot * 0.45], sRoot * 0.1), 1);
+  for (const e of o.eng) { acAdd(P, acNacelle(e[3], e[4], e[0], e[1], e[2]), 3); if (e[5]) acAdd(P, acDisc(e[3] * 3.2, e[0], e[1], e[2] + e[4] / 2 + 0.004), 4); }
+  // navigation lights: red on the left wingtip, green on the right
+  const tipZ = o.wingZ + o.rootC / 2 - half * sw - o.tipC * 0.5, tipY = o.wingY + half * dih;
+  acAdd(P, acLight(-half, tipY, tipZ), 5); acAdd(P, acLight(half, tipY, tipZ), 6);
+  return acBuild(P);
+}
+function acHeli() {
+  const P = acParts();
+  const body = new THREE.SphereGeometry(0.16, 16, 12); body.scale(0.85, 0.9, 1.6); body.translate(0, 0, 0.17); acAdd(P, body, 0);
+  const boom = new THREE.CylinderGeometry(0.025, 0.045, 0.52, 10); boom.rotateX(Math.PI / 2); boom.translate(0, 0.05, -0.2); acAdd(P, boom, 0);
+  acAdd(P, acSlab([0, 0.05, -0.38, -0.5], [0, 0.2, -0.44, -0.52], 0.012, true), 1);
+  const rotor = acDisc(0.5, 0, 0.16, 0.12, 'y'); acAdd(P, rotor, 4);
+  const mast = new THREE.CylinderGeometry(0.012, 0.012, 0.05, 6); mast.translate(0, 0.135, 0.12); acAdd(P, mast, 4);
+  acAdd(P, acLight(-0.12, 0.0, 0.12), 5); acAdd(P, acLight(0.12, 0.0, 0.12), 6);
+  return acBuild(P);
+}
+const AC_GEO = {
+  nb: () => acJet({ R: 0.053, span: 0.92, sweep: 25, rootC: 0.2, tipC: 0.05, wingZ: 0.02, wingY: -0.03, noseK: 0.09, tailK: 0.26, finH: 0.2, stabSpan: 0.34,
+    eng: [[0.17, -0.07, 0.1, 0.03, 0.11], [-0.17, -0.07, 0.1, 0.03, 0.11]] }),
+  wb: () => acJet({ R: 0.045, span: 0.96, sweep: 31, rootC: 0.2, tipC: 0.045, wingZ: 0.03, wingY: -0.025, noseK: 0.08, tailK: 0.25, finH: 0.17, stabSpan: 0.33,
+    eng: [[0.16, -0.06, 0.12, 0.028, 0.1], [-0.16, -0.06, 0.12, 0.028, 0.1]] }),
+  quad: () => acJet({ R: 0.05, span: 1.06, sweep: 34, rootC: 0.21, tipC: 0.045, wingZ: 0.02, wingY: -0.025, noseK: 0.09, tailK: 0.24, finH: 0.18, stabSpan: 0.36, hump: 0.35,
+    eng: [[0.19, -0.055, 0.08, 0.022, 0.09], [-0.19, -0.055, 0.08, 0.022, 0.09], [0.34, -0.035, -0.01, 0.019, 0.08], [-0.34, -0.035, -0.01, 0.019, 0.08]] }),
+  rj: () => acJet({ R: 0.042, span: 0.68, sweep: 26, rootC: 0.16, tipC: 0.04, wingZ: 0.0, wingY: -0.025, noseK: 0.1, tailK: 0.24, finH: 0.19, stabSpan: 0.3, tTail: true, finSweep: 45,
+    eng: [[0.075, 0.035, -0.25, 0.028, 0.12], [-0.075, 0.035, -0.25, 0.028, 0.12]] }),
+  tp: () => acJet({ R: 0.05, span: 1.0, sweep: 2, dihedral: 2, rootC: 0.1, tipC: 0.05, wingZ: 0.06, wingY: 0.052, noseK: 0.1, tailK: 0.3, finH: 0.2, stabSpan: 0.3, tTail: true, finSweep: 35,
+    eng: [[0.16, 0.035, 0.13, 0.026, 0.14, true], [-0.16, 0.035, 0.13, 0.026, 0.14, true]] }),
+  bj: () => acJet({ R: 0.05, span: 0.9, sweep: 28, rootC: 0.2, tipC: 0.06, wingZ: 0.02, wingY: -0.035, noseK: 0.14, tailK: 0.28, finH: 0.22, stabSpan: 0.32, tTail: true, finSweep: 45,
+    eng: [[0.085, 0.04, -0.22, 0.035, 0.14], [-0.085, 0.04, -0.22, 0.035, 0.14]] }),
+  ga: () => acJet({ R: 0.07, span: 1.3, sweep: 0, dihedral: 2, rootC: 0.18, tipC: 0.14, wingZ: 0.12, wingY: 0.06, noseK: 0.12, tailK: 0.4, upsweep: 0.2, finH: 0.19, stabSpan: 0.38, finSweep: 30,
+    eng: [[0, 0, 0.47, 0.035, 0.05, true]] }),
+  heli: acHeli,
 };
-const planes = new THREE.InstancedMesh(planeGeometry(), planeMat, MAX_FL);
-planes.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-planes.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_FL * 3), 3);
-planes.count = 0; planes.frustumCulled = false;
+const AC_CLASSES = Object.keys(AC_GEO);
+const acMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.42, metalness: 0.2, side: THREE.DoubleSide });
+acMat.onBeforeCompile = sh => {
+  sh.vertexShader = sh.vertexShader.replace('#include <common>', `#include <common>
+    attribute float aPart; attribute vec3 iBody; attribute vec3 iTail; attribute vec3 iAlt; attribute float iLen;
+    varying vec3 vPC; varying float vEm;`).replace('#include <begin_vertex>', `#include <begin_vertex>
+    vec3 pc = aPart < 0.5 ? iBody : aPart < 1.5 ? iTail : aPart < 2.5 ? vec3(0.78, 0.79, 0.82) : aPart < 3.5 ? mix(iBody, vec3(0.62), 0.5)
+            : aPart < 4.5 ? vec3(0.1) : aPart < 5.5 ? vec3(1.0, 0.12, 0.1) : vec3(0.15, 1.0, 0.3);
+    // drawn at true size up close; far away the model is enlarged so traffic stays visible, and coloured by altitude
+    float far = smoothstep(1.15, 1.8, length(instanceMatrix[2].xyz) / max(iLen, 1e-9));
+    vPC = mix(pc, iAlt, far);
+    vEm = mix(aPart > 4.5 ? 3.0 : 0.05, 0.35, far);`);
+  sh.fragmentShader = sh.fragmentShader.replace('#include <common>', `#include <common>
+    varying vec3 vPC; varying float vEm;`).replace('#include <color_fragment>', `#include <color_fragment>
+    diffuseColor.rgb *= vPC;`).replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+    totalEmissiveRadiance = vPC * vEm;`);
+};
+const acMeshes = {};
+const planes = new THREE.Group();          // one instanced mesh per body class
+for (const cls of AC_CLASSES) {
+  const g = AC_GEO[cls]();
+  for (const [name, n] of [['iBody', 3], ['iTail', 3], ['iAlt', 3], ['iLen', 1]]) g.setAttribute(name, new THREE.InstancedBufferAttribute(new Float32Array(MAX_FL * n), n));
+  const m = new THREE.InstancedMesh(g, acMat, MAX_FL);
+  m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  m.count = 0; m.frustumCulled = false;
+  acMeshes[cls] = m; planes.add(m);
+}
 scene.add(planes);
+function acRange(attr, n) {
+  if (attr.addUpdateRange) { attr.clearUpdateRanges(); attr.addUpdateRange(0, n); } else attr.updateRange = { offset: 0, count: n };
+  attr.needsUpdate = true;
+}
+
 const trailGeo = new THREE.BufferGeometry();
 trailGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(MAX_FL * 2 * 3), 3).setUsage(THREE.DynamicDrawUsage));
 trailGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(MAX_FL * 2 * 4), 4));
@@ -2767,7 +2930,7 @@ function ingestReadsb(d, src) {
     if (a.lat == null || a.lon == null) continue;
     const ground = a.alt_baro === 'ground';
     const altFt = ground ? 0 : (typeof a.alt_baro === 'number' ? a.alt_baro : (a.alt_geom || 0));
-    upsertFlight({ hex: a.hex, cs: (a.flight || '').trim(), reg: a.r, type: a.t, desc: a.desc, t: now - (a.seen_pos || 0), lat: a.lat, lon: a.lon,
+    upsertFlight({ hex: a.hex, cs: (a.flight || '').trim(), reg: a.r, type: a.t, desc: a.desc, cat: a.category, t: now - (a.seen_pos || 0), lat: a.lat, lon: a.lon,
       alt: altFt * 0.3048, ground, gs: (a.gs || 0) * 0.514444, trk: a.track ?? a.true_heading ?? 0, vr: (a.baro_rate ?? a.geom_rate ?? 0) * 0.00508, sq: a.squawk, src });
     n++;
   }
@@ -2777,15 +2940,14 @@ function rebuildFlightArray() {
   const now = Date.now() / 1000;
   for (const [k, f] of flights) if (now - f.t > 900) flights.delete(k);
   flArr = [...flights.values()].slice(0, MAX_FL);
-  const col = planes.instanceColor.array, c = new THREE.Color(), lo = new THREE.Color(0xff7a59), mid = new THREE.Color(0xffd23f), hi = new THREE.Color(0xf4f7ff);
+  const c = new THREE.Color(), lo = new THREE.Color(0xff7a59), mid = new THREE.Color(0xffd23f), hi = new THREE.Color(0xf4f7ff);
   flArr.forEach((f, i) => {
     f.idx = i;
     if (f.ground) c.set(0x9a93b8);
     else { const t = clamp(f.alt / 11000, 0, 1); t < 0.5 ? c.copy(lo).lerp(mid, t * 2) : c.copy(mid).lerp(hi, (t - 0.5) * 2); }
-    col[i * 3] = c.r; col[i * 3 + 1] = c.g; col[i * 3 + 2] = c.b;
+    f.altCol = [c.r, c.g, c.b];
+    acSpec(f);
   });
-  planes.instanceColor.needsUpdate = true;
-  planes.count = flArr.length;
   trailGeo.setDrawRange(0, flArr.length * 2);
   updateFlightStatus();
 }
@@ -2855,9 +3017,10 @@ function planeFrame(lat, lon, r, trk, out) {
 }
 function updateFlights() {
   if (!planes.visible) return;
-  const now = Date.now() / 1000, m = planes.instanceMatrix.array, cp = camera.position;
+  const now = Date.now() / 1000, cp = camera.position;
   const tp = trailGeo.attributes.position.array, tc = trailGeo.attributes.color.array;
   const showTrails = trails.visible;
+  const cnt = {}; for (const k of AC_CLASSES) cnt[k] = 0;
   for (let i = 0; i < flArr.length; i++) {
     const f = flArr[i];
     predict(f, now);
@@ -2866,10 +3029,11 @@ function updateFlights() {
     f.cLat = lat; f.cLon = lon; f.cAlt = _pAlt;
     const r = planeRadius(f, lat, lon, _pAlt);
     planeFrame(lat, lon, r, f.trk, _p);
-    const dist = _p.distanceTo(cp);
-    let s = Math.max(dist * 0.0035, PLANE_REAL);
-    if (f === selected && mode !== 'plane') s *= 1.7;
-    const o = i * 16;
+    const dist = _p.distanceTo(cp), ac = f.ac || acSpec(f), real = ac.len * TERRAIN_K;
+    let s = Math.max(dist * 0.0035, real);                 // true size up close, enlarged far away so traffic stays visible
+    if (f === selected && mode !== 'plane' && s > real * 1.2) s *= 1.7;
+    const mesh = acMeshes[ac.cls], j = cnt[ac.cls]++, m = mesh.instanceMatrix.array, o = j * 16, G = mesh.geometry.attributes;
+    G.iBody.array.set(ac.body, j * 3); G.iTail.array.set(ac.tail, j * 3); G.iAlt.array.set(f.altCol || [1, 1, 1], j * 3); G.iLen.array[j] = real;
     m[o] = _r.x * s; m[o + 1] = _r.y * s; m[o + 2] = _r.z * s; m[o + 3] = 0;
     m[o + 4] = _n.x * s; m[o + 5] = _n.y * s; m[o + 6] = _n.z * s; m[o + 7] = 0;
     m[o + 8] = _f.x * s; m[o + 9] = _f.y * s; m[o + 10] = _f.z * s; m[o + 11] = 0;
@@ -2885,7 +3049,12 @@ function updateFlights() {
       tc[q + 4] = tc[q + 5] = tc[q + 6] = 1; tc[q + 7] = 0;
     }
   }
-  planes.instanceMatrix.needsUpdate = true;
+  for (const k of AC_CLASSES) {
+    const mesh = acMeshes[k], n = cnt[k], G = mesh.geometry.attributes;
+    mesh.count = n;
+    if (!n) continue;
+    acRange(mesh.instanceMatrix, n * 16); acRange(G.iBody, n * 3); acRange(G.iTail, n * 3); acRange(G.iAlt, n * 3); acRange(G.iLen, n);
+  }
   if (showTrails) { trailGeo.attributes.position.needsUpdate = true; trailGeo.attributes.color.needsUpdate = true; }
 }
 
@@ -3541,7 +3710,7 @@ canvas.addEventListener('pointerup', endPointer);
 canvas.addEventListener('pointercancel', endPointer);
 canvas.addEventListener('wheel', e => { e.preventDefault(); fly = null; zoomBy(Math.exp(e.deltaY * (e.deltaMode ? 0.05 : 0.0012))); }, { passive: false });
 function zoomBy(f) {
-  if (mode === 'plane' || mode === 'iss') { rideDist = clamp(rideDist * f, mode === 'iss' ? 0.00003 : 0.000012, 0.3); return; }
+  if (mode === 'plane' || mode === 'iss') { rideDist = clamp(rideDist * f, mode === 'iss' ? 0.00003 : (selected ? acSpec(selected).len * 1.2 : 12) * TERRAIN_K, 0.3); return; }
   cam.alt = clamp(cam.alt * f, MIN_ALT, MAX_ALT);
 }
 const ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
@@ -3655,7 +3824,7 @@ function setMode(m, silent = false, keepSel = false) {
   if (m === 'plane') {
     if (!keepSel || !selected) selected = pickRidePlane();
     if (!selected) { toast(flArr.length ? 'No airborne planes nearby' : 'No live aircraft yet'); m = 'orbit'; }
-    else { rideDist = 0.00004; rideOrbit.yaw = 0; rideOrbit.pitch = 0.22; showFlightCard(selected); }
+    else { rideDist = (acSpec(selected).len * 2.6) * TERRAIN_K; rideOrbit.yaw = 0; rideOrbit.pitch = 0.2; showFlightCard(selected); }
   }
   if (m === 'iss') {
     if (!issNow) { toast('ISS not loaded yet'); m = 'orbit'; }
@@ -4062,7 +4231,7 @@ function updateCamera(dt) {
   // inside the atmosphere / cloud layer we look at the shells from within
   const inAtmo = cd < 1 + ATMO_KM * KM, inCloud = cd < CLOUD_SHELL_R;
   skyMat.side = inAtmo ? THREE.BackSide : THREE.FrontSide;
-  cloudMat.side = inCloud ? THREE.BackSide : THREE.FrontSide; cloudMat.depthTest = !inCloud; cloudU.inShell.value = inCloud ? 1 : 0;
+  cloudMat.side = inCloud ? THREE.BackSide : THREE.FrontSide; cloudU.inShell.value = inCloud ? 1 : 0;
   U.pixAng.value = 2 * Math.tan(camera.fov * DEG / 2) / (innerHeight * renderer.getPixelRatio());
   U.windOff.value.x += dt * 0.012; U.windOff.value.z += dt * 0.005;           // slow churn of cloud detail (km)
   U.cloudAge.value = cloudTime ? clamp((Date.now() - cloudTime) / 1000, 0, 3 * 3600) : 0;
@@ -4105,11 +4274,11 @@ function frame() {
   adaptQuality(raw * 1000, now);
   U.time.value += dt; U.frameN.value = (U.frameN.value + 1) % 4096;
   updateSky();
-  const alt = updateCamera(dt);
+  updateFlights();                                // move aircraft first so a ride camera frames where the plane is now
+  const alt = updateCamera(Math.min(raw, 1.0));   // real frame time: at low fps a 0.1 s cap left the ride camera trailing far behind the aircraft
   updateTiles();
   const focus = focusLatLon();
   updateMapData(now, alt, focus);
-  updateFlights();
   updateSurfaceTraffic(alt);
   glmU.uPx.value = pxScale; updateCyclones(dt, alt);
   updateSatellites();
